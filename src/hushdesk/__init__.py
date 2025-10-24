@@ -1,1 +1,1 @@
-"""HushDesk placeholder package."""
+__all__ = ["cli"]

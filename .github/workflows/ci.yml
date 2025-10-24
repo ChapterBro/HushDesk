@@ -1,0 +1,24 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  syntax-and-sims:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+      - name: Syntax only
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python - <<'PY'
+          import sys, pathlib, py_compile
+          fails=[]
+          for p in pathlib.Path("src").rglob("*.py"):
+              try: py_compile.compile(str(p), doraise=True)
+              except Exception as e: fails.append((str(p),str(e)))
+          if fails:
+              print("PY_COMPILE: FAIL"); [print(" -",f,e) for f,e in fails]; sys.exit(1)
+          print("PY_COMPILE: OK")
+          PY
+      - name: Simulation regression
+        run: |
+          PYTHONPATH=src python tools/simregress.py

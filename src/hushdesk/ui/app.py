@@ -1,0 +1,549 @@
+from __future__ import annotations
+import os
+import re
+import threading
+import time
+from pathlib import Path
+from typing import Dict, List, Optional
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD  # type: ignore
+
+    _HAS_DND = True
+except Exception:  # pragma: no cover - optional dependency
+    _HAS_DND = False
+
+from hushdesk.ui.theme import load_theme_name, save_theme_name, select_palette
+from hushdesk.ui.util import hall_from_rooms
+from hushdesk.core.engine import run_sim
+
+USE_PDF_BACKEND = False  # future switch
+
+
+def run_simulation(fixture_path: str, room_pattern: str | None = None) -> dict:
+    payload = run_sim.run_from_fixture(fixture_path)
+    records = payload.get("records", [])
+    if room_pattern:
+        try:
+            regex = re.compile(room_pattern)
+        except re.error as exc:  # propagate for UI warning
+            raise ValueError(f"Invalid room filter: {exc}") from exc
+        filtered_records = [rec for rec in records if regex.search(rec.room)]
+        header_meta = dict(payload.get("header", {}))
+        header_meta["pages"] = payload.get("pages", 1)
+        rows = payload.get("fixture_rows", [])
+        filtered_rows = [row for row in rows if regex.search(str(row.get("room", "")))]
+        dose_total = 0
+        for row in filtered_rows:
+            if not row.get("rules"):
+                continue
+            if "AM" in row:
+                dose_total += 1
+            if "PM" in row:
+                dose_total += 1
+        payload = run_sim.build_payload(filtered_records, header_meta=header_meta, dose_total=dose_total or None)
+        records = filtered_records
+    payload["records"] = records
+    payload["rooms"] = sorted({rec.room for rec in records})
+    return payload
+
+
+def run_pdf_backend(pdf_path: str, date_str: str, room_filter: str | None) -> dict:  # pragma: no cover - placeholder
+    if not USE_PDF_BACKEND:
+        raise RuntimeError("PDF backend disabled in this build.")
+    from hushdesk.core.engine import run_pdf  # type: ignore
+
+    return run_pdf.run_on_pdf(pdf_path, date_str=date_str, room_filter=room_filter)
+
+
+class HushDeskApp:
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
+        self.theme_name = load_theme_name()
+        self.palette = select_palette(self.theme_name)
+        self.state = {
+            "file": None,
+            "hall": None,
+            "last_payload": None,
+            "last_summary": {"reviewed": 0, "hold_miss": 0, "held_ok": 0, "compliant": 0, "dcd": 0},
+        }
+
+        self._apply_theme()
+        self._build_ui()
+        self._show_startup()
+
+    # ------------------------------------------------------------------
+    # Theme / UI construction
+    def _apply_theme(self) -> None:
+        p = self.palette
+        self.root.configure(bg=p["bg"])
+        style = ttk.Style(self.root)
+        style.configure("TLabel", background=p["bg"], foreground=p["text"])
+        style.configure("Muted.TLabel", background=p["bg"], foreground=p["muted"])
+        style.configure("Card.TFrame", background=p.get("surface", p["bg"]), borderwidth=1, relief="solid")
+        style.configure("Banner.TFrame", background=p["banner"]["bg"], borderwidth=1, relief="solid")
+        style.configure("Banner.TLabel", background=p["banner"]["bg"], foreground=p["banner"]["text"])
+        style.configure("DangerStripe.TFrame", background=p["danger"])
+        style.configure("DangerTint.TFrame", background=p["danger_tint"])
+
+    def _build_ui(self) -> None:
+        p = self.palette
+        self.root.title("HushDesk")
+        self.root.geometry("1080x720")
+
+        top = tk.Frame(self.root, bg=p["bg"])
+        top.pack(fill="x", pady=(8, 4), padx=12)
+        ttk.Label(top, text="HushDesk", font=("Segoe UI", 16, "bold")).pack(side="left")
+        top_right = tk.Frame(top, bg=p["bg"])
+        top_right.pack(side="right")
+        self.theme_btn = ttk.Button(top_right, text=self._theme_button_label(), command=self._toggle_theme)
+        self.theme_btn.pack(side="right", padx=(8, 0))
+        modules_btn = ttk.Menubutton(top_right, text="••• Modules")
+        modules_menu = tk.Menu(modules_btn, tearoff=0)
+        modules_menu.add_command(label="BP Meds", state="disabled")
+        for label in ("Showers", "Point-of-Care", "Skilled Charting", "MAR/TAR Completion"):
+            modules_menu.add_command(label=f"{label}  🔒", state="disabled")
+        modules_btn["menu"] = modules_menu
+        modules_btn.pack(side="right")
+
+        # Header card ---------------------------------------------------
+        self.audit_date_var = tk.StringVar(value="Audit Date: (select MAR)")
+        self.hall_var = tk.StringVar(value="Hall: —")
+
+        header = ttk.Frame(self.root, style="Card.TFrame")
+        header.pack(fill="x", padx=12, pady=(4, 8))
+        ttk.Label(header, textvariable=self.audit_date_var, font=("Segoe UI", 18, "bold")).grid(row=0, column=0, sticky="w", padx=12, pady=(12, 2))
+        ttk.Label(header, textvariable=self.hall_var, style="Muted.TLabel").grid(row=1, column=0, sticky="w", padx=12)
+
+        file_frame = ttk.Frame(header, style="Card.TFrame")
+        file_frame.grid(row=0, column=1, rowspan=2, sticky="ew", padx=12, pady=12)
+        header.grid_columnconfigure(1, weight=1)
+        ttk.Label(file_frame, text="MAR PDF or Fixture", style="Muted.TLabel").pack(anchor="w", padx=12, pady=(8, 2))
+        self.file_var = tk.StringVar(value="(none)")
+        file_row = tk.Frame(file_frame, bg=p.get("surface", p["bg"]))
+        file_row.pack(fill="x", padx=12, pady=(0, 12))
+        ttk.Label(file_row, textvariable=self.file_var).pack(side="left")
+        ttk.Button(file_row, text="Browse…", command=self._browse_file).pack(side="right")
+        if _HAS_DND:
+            try:
+                self.root.drop_target_register(DND_FILES)
+                self.root.dnd_bind("<<Drop>>", self._on_drop_files)
+            except Exception:
+                pass
+
+        self.banner = ttk.Frame(self.root, style="Banner.TFrame")
+        self.banner_msg = ttk.Label(self.banner, text="Hall couldn’t be confirmed.", style="Banner.TLabel")
+        self.banner_msg.pack(padx=12, pady=6)
+        self.banner.pack_forget()
+
+        # Run controls --------------------------------------------------
+        run_row = tk.Frame(self.root, bg=p["bg"])
+        run_row.pack(fill="x", padx=12, pady=(6, 0))
+        primary = ttk.Button(run_row, text="Run Audit", command=self._run_audit)
+        primary.pack(side="left")
+        self.quick_menu = ttk.Menubutton(run_row, text="Quick Actions")
+        qm = tk.Menu(self.quick_menu, tearoff=0)
+        qm.add_command(label="Quick Check", command=self._quick_check)
+        self.quick_menu["menu"] = qm
+        self.quick_menu.pack(side="left", padx=(8, 0))
+
+        filter_box = tk.Frame(run_row, bg=p["bg"])
+        filter_box.pack(side="right")
+        ttk.Label(filter_box, text="Filter rooms", style="Muted.TLabel").pack(side="left", padx=(0, 6))
+        self.filter_var = tk.StringVar()
+        ttk.Entry(filter_box, textvariable=self.filter_var, width=18).pack(side="left")
+        for chip in ("100", "200", "300", "400"):
+            btn = ttk.Button(filter_box, text=chip, command=lambda c=chip: self.filter_var.set(fr"^{c[0]}\d\d-"))
+            btn.pack(side="left", padx=3)
+
+        # Progress + Summary -------------------------------------------
+        progress_card = ttk.Frame(self.root, style="Card.TFrame")
+        progress_card.pack(fill="x", padx=12, pady=(12, 6))
+        self.progress = ttk.Progressbar(progress_card, mode="determinate", maximum=100)
+        self.progress.pack(fill="x", padx=12, pady=(10, 6))
+        self.progress_lbl = ttk.Label(progress_card, text="", style="Muted.TLabel")
+        self.progress_lbl.pack(anchor="w", padx=12, pady=(0, 10))
+
+        sum_row = tk.Frame(self.root, bg=p["bg"])
+        sum_row.pack(fill="x", padx=12, pady=(0, 8))
+        self.sum_lbls = {
+            "reviewed": ttk.Label(sum_row, text="Reviewed 0"),
+            "hold_miss": ttk.Label(sum_row, text="Hold-Miss 0"),
+            "held_ok": ttk.Label(sum_row, text="Held-OK 0"),
+            "compliant": ttk.Label(sum_row, text="Compliant 0"),
+            "dcd": ttk.Label(sum_row, text="DC'D 0"),
+        }
+        self.sum_lbls["reviewed"].pack(side="left")
+        ttk.Label(sum_row, text="  |  ", style="Muted.TLabel").pack(side="left")
+        self.sum_lbls["hold_miss"].pack(side="left")
+        ttk.Label(sum_row, text="  |  ", style="Muted.TLabel").pack(side="left")
+        self.sum_lbls["held_ok"].pack(side="left")
+        ttk.Label(sum_row, text="  |  ", style="Muted.TLabel").pack(side="left")
+        self.sum_lbls["compliant"].pack(side="left")
+        ttk.Label(sum_row, text="  |  ", style="Muted.TLabel").pack(side="left")
+        self.sum_lbls["dcd"].pack(side="left")
+
+        # Results container --------------------------------------------
+        self.results = tk.Frame(self.root, bg=p["bg"])
+        self.results.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+        # Actions -------------------------------------------------------
+        actions = tk.Frame(self.root, bg=p["bg"])
+        actions.pack(fill="x", padx=12, pady=(0, 8))
+        ttk.Button(actions, text="Copy Checklist", command=self._copy_txt).pack(side="left")
+        ttk.Button(actions, text="Save TXT", command=self._save_txt).pack(side="left", padx=(8, 0))
+
+        # Footer --------------------------------------------------------
+        footer = tk.Frame(self.root, bg=p["bg"])
+        footer.pack(fill="x", padx=12, pady=(4, 8))
+        self.footer_time = ttk.Label(footer, text="Time: —", style="Muted.TLabel")
+        self.footer_time.pack(side="left")
+        ttk.Button(footer, text="Safety: On", command=self._show_safety).pack(side="right")
+
+        self._set_summary(self.state["last_summary"])
+
+    # ------------------------------------------------------------------
+    # Theme toggle helpers
+    def _theme_button_label(self) -> str:
+        return "Dark" if self.theme_name != "dark" else "Light"
+
+    def _toggle_theme(self) -> None:
+        self.theme_name = "dark" if self.theme_name != "dark" else "light"
+        save_theme_name(self.theme_name)
+        self.palette = select_palette(self.theme_name)
+        self._apply_theme()
+        self._repaint()
+        self.theme_btn.config(text=self._theme_button_label())
+        self._set_summary(self.state["last_summary"])
+
+    def _repaint(self) -> None:
+        bg = self.palette["bg"]
+        for widget in self.root.winfo_children():
+            try:
+                widget.configure(bg=bg)
+            except tk.TclError:
+                pass
+
+    # ------------------------------------------------------------------
+    # Startup + dialogs
+    def _show_startup(self) -> None:
+        top = tk.Toplevel(self.root)
+        top.title("Welcome to HushDesk")
+        top.transient(self.root)
+        top.grab_set()
+        p = self.palette
+        top.configure(bg=p["bg"])
+        frame = tk.Frame(top, bg=p["bg"])
+        frame.pack(padx=20, pady=18)
+
+        def add_section(title: str, body: str) -> None:
+            tk.Label(frame, text=title, font=("Segoe UI", 12, "bold"), bg=p["bg"], fg=p["text"]).pack(anchor="w")
+            tk.Label(frame, text=body, justify="left", wraplength=520, bg=p["bg"], fg=p["text"]).pack(anchor="w", pady=(0, 10))
+
+        add_section("What HushDesk does", "Checks BP med pass compliance by matching hold rules to what was documented for each dose on the chosen date.")
+        add_section("What you’ll see", "• Hold-Miss — should’ve been held, but was given.\n• Held-OK — valid hold code (4, 6, 11, 12, 15).\n• Compliant — given and within the rule.\n• DC’D — clearly X’d out for the day.\n• Reviewed — how many doses we checked.")
+        add_section("Privacy", "• Runs completely offline. HushDesk never uses the internet.\n• Never stores PHI/PII (outputs are hall + room only).\n• Files you save remain on your machine with private permissions.\n• Encryption at rest is planned.")
+        ttk.Button(frame, text="Got it", command=top.destroy).pack(anchor="e", pady=(4, 0))
+
+    def _show_safety(self) -> None:
+        messagebox.showinfo(
+            "Safety",
+            "• Runs completely offline (no internet).\n"
+            "• Never stores PHI/PII (hall + room only).\n"
+            "• Files you save stay on your machine with private permissions.\n"
+            "• Encryption at rest is planned.",
+        )
+
+    # ------------------------------------------------------------------
+    # File selection
+    def _on_drop_files(self, event) -> None:  # type: ignore[override]
+        files = self.root.splitlist(event.data)
+        if files:
+            self._set_file(Path(files[0]))
+
+    def _browse_file(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Select MAR PDF or fixture",
+            filetypes=[("JSON fixtures", "*.json"), ("PDF files", "*.pdf"), ("All files", "*.*")],
+        )
+        if path:
+            self._set_file(Path(path))
+
+    def _set_file(self, path: Path) -> None:
+        self.state["file"] = path
+        self.file_var.set(path.name)
+        rooms: List[str] = []
+        date_display: Optional[str] = None
+        if path.suffix.lower() == ".json":
+            try:
+                fx = run_sim.load_fixture(str(path))
+                rooms = [row.get("room") for row in fx.get("rows", []) if row.get("room")]
+                date_display = fx["meta"].get("date")
+            except Exception:
+                rooms = []
+        hall, hall_num = hall_from_rooms(rooms)
+        if hall and hall_num:
+            self.hall_var.set(f"Hall: {hall_num} (auto)")
+            self.banner.pack_forget()
+        else:
+            self.hall_var.set("Hall: —")
+            self.banner.pack(fill="x", padx=12, pady=(0, 8))
+        if date_display:
+            self.audit_date_var.set(f"Audit Date: {date_display} (Central)")
+        else:
+            self.audit_date_var.set("Audit Date: (select date)")
+
+    # ------------------------------------------------------------------
+    # Rendering helpers
+    def _set_summary(self, summary: Dict[str, int]) -> None:
+        self.state["last_summary"] = summary
+        nums = self.palette["summary_nums"]
+        self.sum_lbls["reviewed"].configure(
+            text=f"Reviewed {int(summary.get('reviewed', 0))}", foreground=nums["reviewed"]
+        )
+        self.sum_lbls["hold_miss"].configure(
+            text=f"Hold-Miss {int(summary.get('hold_miss', 0))}", foreground=nums["hold_miss"]
+        )
+        self.sum_lbls["held_ok"].configure(
+            text=f"Held-OK {int(summary.get('held_ok', 0))}", foreground=nums["held_ok"]
+        )
+        self.sum_lbls["compliant"].configure(
+            text=f"Compliant {int(summary.get('compliant', 0))}", foreground=nums["compliant"]
+        )
+        self.sum_lbls["dcd"].configure(
+            text=f"DC'D {int(summary.get('dcd', 0))}", foreground=nums["dcd"]
+        )
+
+    def _clear_results(self) -> None:
+        for widget in self.results.winfo_children():
+            widget.destroy()
+
+    def _render_violations(self, violations: List[str]) -> None:
+        if not violations:
+            ttk.Label(self.results, text="No exceptions.", font=("Segoe UI", 11, "bold")).pack(anchor="w", pady=(2, 4))
+            return
+        ttk.Label(self.results, text="Violations", font=("Segoe UI", 11, "bold"), foreground=self.palette["danger"]).pack(anchor="w", pady=(2, 4))
+        for line in violations:
+            row = tk.Frame(self.results, bg=self.palette["bg"])
+            tk.Frame(row, width=3, height=20, bg=self.palette["danger"]).pack(side="left", fill="y")
+            tint = tk.Frame(row, bg=self.palette["danger_tint"])
+            tint.pack(side="left", fill="x", expand=True)
+            tk.Label(tint, text=line, bg=self.palette["danger_tint"], fg=self.palette["text"]).pack(anchor="w", padx=8, pady=2)
+            row.pack(fill="x", pady=2)
+
+    def _render_all_reviewed(self, groups: Dict[str, List[str]]) -> None:
+        card = ttk.Frame(self.results, style="Card.TFrame")
+        card.pack(fill="both", expand=True, pady=(8, 0))
+        header = tk.Frame(card, bg=self.palette.get("surface", self.palette["bg"]))
+        header.pack(fill="x")
+        ttk.Label(header, text="All Reviewed", font=("Segoe UI", 11, "bold")).pack(side="left", padx=12, pady=8)
+        body = tk.Frame(card, bg=self.palette.get("surface", self.palette["bg"]))
+        expanded = {"v": False}
+
+        def populate() -> None:
+            for child in body.winfo_children():
+                child.destroy()
+            mapping = [
+                ("HOLD-MISS", "HOLD-MISS"),
+                ("HELD-OK", "HELD-OK"),
+                ("COMPLIANT", "COMPLIANT"),
+                ("DC'D", "DC'D"),
+            ]
+            for key, title in mapping:
+                items = groups.get(key, [])
+                section = tk.Frame(body, bg=self.palette.get("surface", self.palette["bg"]))
+                section.pack(fill="x", padx=12, pady=(6, 2))
+                ttk.Label(section, text=f"{title} ({len(items)})", style="Muted.TLabel").pack(anchor="w")
+                for line in items:
+                    if key == "HOLD-MISS":
+                        row = tk.Frame(section, bg=self.palette.get("surface", self.palette["bg"]))
+                        row.pack(fill="x", pady=1)
+                        tk.Frame(row, bg=self.palette["danger"], width=3, height=20).pack(side="left", fill="y")
+                        tk.Label(row, text=line, bg=self.palette["danger_tint"], fg=self.palette["text"]).pack(side="left", fill="x", expand=True, padx=8, pady=2)
+                    else:
+                        tk.Label(section, text=line, bg=self.palette.get("surface", self.palette["bg"]), fg=self.palette["text"]).pack(anchor="w", padx=8, pady=2)
+
+        def toggle() -> None:
+            expanded["v"] = not expanded["v"]
+            if expanded["v"]:
+                populate()
+                body.pack(fill="both", expand=True)
+                toggle_btn.configure(text="Hide")
+            else:
+                body.pack_forget()
+                toggle_btn.configure(text="Show")
+
+        toggle_btn = ttk.Button(header, text="Show", command=toggle)
+        toggle_btn.pack(side="right", padx=12)
+
+    # ------------------------------------------------------------------
+    # Backend interaction helpers
+    def _selected_path(self) -> Path | None:
+        return self.state["file"]
+
+    def _compute_payload(self) -> dict:
+        path = self._selected_path()
+        if not path:
+            raise RuntimeError("Select a MAR (PDF or fixture) first.")
+        room_pattern = self.filter_var.get().strip() or None
+        if path.suffix.lower() == ".json":
+            payload = run_simulation(str(path), room_pattern)
+        else:
+            payload = run_pdf_backend(str(path), date_str="", room_filter=room_pattern)
+        return payload
+
+    def _update_header_from_payload(self, payload: dict) -> None:
+        rooms = payload.get("rooms", [])
+        hall, hall_num = hall_from_rooms(rooms)
+        if hall_num:
+            self.hall_var.set(f"Hall: {hall_num} (auto)")
+            self.banner.pack_forget()
+        else:
+            self.hall_var.set("Hall: —")
+            self.banner.pack(fill="x", padx=12, pady=(0, 8))
+        self.audit_date_var.set(f"Audit Date: {payload['header']['date_str']} (Central)")
+
+    def _after_start(self, text: str, mode: str) -> None:
+        if mode == "quick":
+            self.progress.configure(mode="indeterminate")
+            self.progress.start(55)
+            self.progress_lbl.configure(text=text)
+        else:
+            self.progress.configure(mode="determinate", value=0, maximum=100)
+            self.progress_lbl.configure(text=text)
+
+    def _after_finish(self) -> None:
+        self.progress.stop()
+        self.progress_lbl.configure(text="")
+        self.progress.configure(value=0)
+
+    def _quick_check(self) -> None:
+        try:
+            self._compute_payload  # ensure file selected check earlier
+        except RuntimeError:
+            pass
+        if not self._selected_path():
+            messagebox.showwarning("HushDesk", "Select a MAR (PDF or fixture) first.")
+            return
+        self._clear_results()
+        self._after_start("Checking…", mode="quick")
+
+        def worker():
+            start = time.time()
+            try:
+                payload = self._compute_payload()
+            except Exception as exc:  # relay to UI
+                self.root.after(0, lambda: messagebox.showerror("HushDesk", f"Quick Check failed:\n{exc}"))
+            else:
+                elapsed = time.time() - start
+                self.root.after(0, lambda: self._on_quick_check_done(payload, elapsed))
+            finally:
+                self.root.after(0, self._after_finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_quick_check_done(self, payload: dict, elapsed: float) -> None:
+        self.state["last_payload"] = payload
+        self._update_header_from_payload(payload)
+        self._set_summary(payload["summary"])
+        self._clear_results()
+        self._render_violations(payload.get("violations", []))
+        self.footer_time.configure(text=f"Time: {elapsed:.1f}s")
+
+    def _run_audit(self) -> None:
+        if not self._selected_path():
+            messagebox.showwarning("HushDesk", "Select a MAR (PDF or fixture) first.")
+            return
+        self._clear_results()
+        self._after_start("Preparing…", mode="audit")
+
+        def worker():
+            start = time.time()
+            try:
+                payload = self._compute_payload()
+            except Exception as exc:
+                self.root.after(0, lambda: messagebox.showerror("HushDesk", f"Run Audit failed:\n{exc}"))
+                self.root.after(0, self._after_finish)
+                return
+            elapsed = time.time() - start
+            self.root.after(0, lambda: self._on_run_audit_done(payload, elapsed))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _animate_pages(self, pages: int, callback) -> None:
+        pages = max(pages, 1)
+
+        def step(i: int) -> None:
+            self.progress["value"] = (i / pages) * 100
+            self.progress_lbl.configure(text=f"Page {i} of {pages}")
+            if i < pages:
+                self.root.after(60, lambda: step(i + 1))
+            else:
+                callback()
+
+        step(1)
+
+    def _on_run_audit_done(self, payload: dict, elapsed: float) -> None:
+        self.state["last_payload"] = payload
+        self._update_header_from_payload(payload)
+        self._set_summary(payload["summary"])
+
+        def finalize() -> None:
+            self._clear_results()
+            if payload["summary"]["hold_miss"] == 0:
+                ttk.Label(self.results, text="Hold-Miss: 0 (no exceptions)", font=("Segoe UI", 11, "bold")).pack(anchor="w")
+            else:
+                self._render_violations(payload.get("violations", []))
+            self._render_all_reviewed(payload.get("groups", {}))
+            self.footer_time.configure(text=f"Time: {elapsed:.1f}s")
+            self._after_finish()
+
+        self._animate_pages(payload.get("pages", 1), finalize)
+
+    # ------------------------------------------------------------------
+    # Clipboard / file actions
+    def _require_payload(self) -> dict:
+        payload = self.state.get("last_payload")
+        if not payload:
+            raise RuntimeError("No checklist available yet. Run Quick Check or Run Audit first.")
+        return payload
+
+    def _copy_txt(self) -> None:
+        try:
+            payload = self._require_payload()
+            txt = payload.get("txt_preview", "")
+            if not txt:
+                raise RuntimeError("No TXT preview available.")
+            self.root.clipboard_clear()
+            self.root.clipboard_append(txt)
+            self.root.update()
+            messagebox.showinfo("HushDesk", "Checklist copied to clipboard.")
+        except Exception as exc:
+            messagebox.showerror("HushDesk", f"Copy failed:\n{exc}")
+
+    def _save_txt(self) -> None:
+        try:
+            payload = self._require_payload()
+            default_name = f"bp_audit_{payload['header']['date_str']}_{payload['header']['hall'].lower()}_gui.txt"
+            out_path = filedialog.asksaveasfilename(defaultextension=".txt", initialfile=default_name, title="Save checklist")
+            if not out_path:
+                return
+            from hushdesk.core.export.checklist_render import write_txt
+
+            write_txt(str(out_path), payload["header"], payload["summary"], payload["sections"])
+            messagebox.showinfo("HushDesk", f"Saved: {out_path}")
+        except Exception as exc:
+            messagebox.showerror("HushDesk", f"Save failed:\n{exc}")
+
+
+def main() -> None:  # pragma: no cover - UI entry point
+    root_cls = TkinterDnD.Tk if _HAS_DND else tk.Tk  # type: ignore
+    root = root_cls()
+    app = HushDeskApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":  # pragma: no cover
+    main()

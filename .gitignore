@@ -205,3 +205,30 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+# python
+.venv/
+__pycache__/
+*.pyc
+.pycache/
+.build/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+
+# app outputs
+out/
+
+# OS/editor
+.DS_Store
+.vscode/
+Thumbs.db
+
+# PDFs and images not in fixtures
+*.pdf
+*.PDF
+*.png
+*.jpg
+*.jpeg
+!.github/
+!fixtures/**

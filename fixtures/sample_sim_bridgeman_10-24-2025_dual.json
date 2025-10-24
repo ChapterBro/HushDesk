@@ -1,0 +1,18 @@
+{
+  "meta": { "date": "10-24-2025", "hall": "Bridgeman" },
+  "rows": [
+    {
+      "room": "301A",
+      "rules": [
+        { "metric": "SBP", "op": ">", "threshold": 160 },
+        { "metric": "HR",  "op": "<", "threshold": 60 }
+      ],
+      "AM": { "due": { "given": true, "time": "08:00" }, "bp": { "sbp": 168, "dbp": 68, "hr": 55 }, "page": 1, "col": 24 }
+    },
+    {
+      "room": "318B",
+      "rules": [ { "metric": "SBP", "op": ">", "threshold": 160 } ],
+      "PM": { "due": { "chart_code": 7 }, "bp": { "sbp": 170, "dbp": 70 }, "page": 1, "col": 24 }
+    }
+  ]
+}

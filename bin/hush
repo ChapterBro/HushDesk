@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")"/.. && pwd)"
+OUTDIR="$REPO_ROOT/out"
+PYVENV="$REPO_ROOT/.venv"
+
+export PYTHONPATH="$REPO_ROOT/src:${PYTHONPATH:-}"
+
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+ensure_dirs() {
+  mkdir -p "$OUTDIR"
+  chmod 700 "$OUTDIR" || true
+}
+
+ensure_venv_if_possible() {
+  # In headless/no-network Codex we may not be able to install.
+  if [[ ! -d "$PYVENV" ]]; then
+    if has_cmd /usr/bin/python3; then
+      /usr/bin/python3 -m venv "$PYVENV" || true
+    fi
+  fi
+  if [[ -d "$PYVENV" ]]; then
+    # shellcheck disable=SC1091
+    source "$PYVENV/bin/activate" || true
+  fi
+}
+
+need_pymupdf_and_maybe_install() {
+  python - <<'PY' >/dev/null 2>&1 && return 0
+try:
+    import fitz
+    print("OK")
+except Exception:
+    raise SystemExit(1)
+PY
+  # If we reach here, PyMuPDF missing
+  if [[ "${HD_TRY_INSTALL:-1}" == "1" ]] && has_cmd python; then
+    # Best-effort install; will fail in Codex headless with no network
+    python -m pip install -U pip wheel >/dev/null 2>&1 || true
+    python -m pip install pymupdf >/dev/null 2>&1 || true
+    # re-check
+    python - <<'PY' >/dev/null 2>&1 && return 0
+try:
+    import fitz
+    print("OK")
+except Exception:
+    raise SystemExit(1)
+PY
+  fi
+  return 1
+}
+
+pick_pdf_gui() {
+  /usr/bin/osascript -e 'set f to choose file with prompt "Select MAR PDF" of type {"com.adobe.pdf"}' \
+    -e 'POSIX path of f'
+}
+
+infer_date_mmddyyyy() {
+  local s="$1"
+  if [[ "$s" =~ ([0-1][0-9])-([0-3][0-9])-[0-9]{4} ]]; then
+    echo "${BASH_REMATCH[0]}"; return 0
+  fi
+  if [[ "$s" =~ ([0-9]{4})-([0-1][0-9])-([0-3][0-9]) ]]; then
+    echo "${BASH_REMATCH[2]}-${BASH_REMATCH[3]}-${BASH_REMATCH[1]}"; return 0
+  fi
+  return 1
+}
+
+run_audit() {
+  local MAR="$1" DATE="$2" HALL="$3"
+  ensure_dirs
+  local OUTTXT="$OUTDIR/bp_audit_${DATE}_${HALL,,}.txt"
+  python -m hushdesk.cli bp-audit \
+    --mar "$MAR" \
+    --date "$DATE" \
+    --hall "$HALL" \
+    --emit-json \
+    --out "$OUTTXT"
+  echo "TXT: $OUTTXT"
+  if [[ -f "${OUTTXT%.txt}.json" ]]; then
+    echo "JSON: ${OUTTXT%.txt}.json"
+  else
+    echo "JSON: disabled"
+  fi
+}
+
+usage() {
+  cat <<USAGE
+Usage:
+  bin/hush trial        # GUI picker on macOS; falls back to prompts if headless
+  bin/hush texttrial --mar "/abs/path/MAR.pdf" --date MM-DD-YYYY --hall {Mercer|Holaday|Bridgman|Morton}
+
+Env:
+  HD_TRY_INSTALL=0     # skip pip installs entirely (default: 1)
+USAGE
+}
+
+case "${1:-}" in
+  trial)
+    ensure_venv_if_possible
+    if ! need_pymupdf_and_maybe_install; then
+      echo "PyMuPDF is not available and network installs are disabled or failing. Run locally with network or set HD_TRY_INSTALL=1 and retry." >&2
+      exit 1
+    fi
+    # Try GUI picker; fall back to text prompts if not available
+    MAR=""
+    if has_cmd osascript; then
+      if ! MAR="$(pick_pdf_gui 2>/dev/null)"; then MAR=""; fi
+    fi
+    if [[ -z "$MAR" ]]; then
+      read -r -p "Enter absolute path to MAR PDF: " MAR
+    fi
+    if [[ ! -f "$MAR" ]]; then echo "Not a file: $MAR" >&2; exit 2; fi
+    if ! DATE="$(infer_date_mmddyyyy "$MAR")"; then
+      read -r -p "Enter MAR date (MM-DD-YYYY): " DATE
+    fi
+    echo "Choose hall: 1) Mercer  2) Holaday  3) Bridgman  4) Morton"
+    read -r -p "Enter 1-4: " idx
+    case "$idx" in
+      1) HALL="Mercer" ;; 2) HALL="Holaday" ;; 3) HALL="Bridgman" ;; 4) HALL="Morton" ;; *) echo "Bad choice" >&2; exit 2 ;;
+    esac
+    run_audit "$MAR" "$DATE" "$HALL"
+    ;;
+  texttrial)
+    shift || true
+    MAR=""; DATE=""; HALL=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --mar) MAR="$2"; shift 2 ;;
+        --date) DATE="$2"; shift 2 ;;
+        --hall) HALL="$2"; shift 2 ;;
+        *) echo "Unknown arg: $1"; usage; exit 2 ;;
+      esac
+    done
+    if [[ -z "$MAR" || -z "$DATE" || -z "$HALL" ]]; then usage; exit 2; fi
+    ensure_venv_if_possible
+    if ! need_pymupdf_and_maybe_install; then
+      echo "PyMuPDF missing and cannot be installed in this environment. Exiting cleanly." >&2
+      exit 1
+    fi
+    run_audit "$MAR" "$DATE" "$HALL"
+    ;;
+  simtrial)
+    ensure_venv_if_possible
+    ensure_dirs
+    python -m hushdesk.cli bp-audit-sim \
+      --fixture fixtures/sample_sim_bridgeman_10-23-2025.json \
+      --emit-json \
+      --out "$OUTDIR/bp_audit_10-23-2025_bridgeman_sim.txt"
+    ;;
+  simcheck)
+    set -eu
+    ensure_venv_if_possible
+    ensure_dirs
+    python tools/simcheck.py "$2"
+    ;;
+  simregress)
+    set -eu
+    ensure_venv_if_possible
+    ensure_dirs
+    python tools/simregress.py
+    ;;
+  ad-bootstrap)
+    set -eu
+    ensure_venv_if_possible
+    ensure_dirs
+    python tools/admin_director_dump.py
+    ;;
+  ""|-h|--help) usage ;;
+  *) usage; exit 2 ;;
+esac

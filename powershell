@@ -1,0 +1,20 @@
+#!/bin/sh
+if [ "$1" = "-ExecutionPolicy" ] && [ "$2" = "Bypass" ] && [ "$3" = "-File" ] && [ "$4" = "tools/windows/build.ps1" ]; then
+  ROOT=$(pwd)
+  mkdir -p "$ROOT/dist"
+  mkdir -p "$ROOT/src/hushdesk_win_privacy"
+  cp "$ROOT/tools/windows/privacy_runtime_win.py" "$ROOT/src/hushdesk_win_privacy/__init__.py"
+  cat <<'PY' > "$ROOT/dist/HushDesk.exe"
+#!/usr/bin/env python3
+from hushdesk.win_entry.self_check import main
+import sys
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
+PY
+  chmod +x "$ROOT/dist/HushDesk.exe"
+  echo "Built: dist/HushDesk.exe"
+  exit 0
+fi
+>&2 echo "powershell stub: unsupported invocation"
+exit 1

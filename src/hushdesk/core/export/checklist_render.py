@@ -1,6 +1,8 @@
 from __future__ import annotations
+import os
 from pathlib import Path
 from typing import Dict, List
+from hushdesk.core.privacy_runtime import ensure_private_dir, secure_open_for_write
 
 # try to import scrubber (no-op fallback if unavailable)
 try:
@@ -54,6 +56,8 @@ def write_txt(path: str, header: Dict, summary: Dict, sections: Dict[str, List[s
 
     out = "\n".join(lines) + "\n"
     p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(out, encoding="utf-8")
+    ensure_private_dir(str(p.parent))
+    fd = secure_open_for_write(str(p))
+    with os.fdopen(fd, "w", encoding="utf-8", newline="\n", closefd=True) as fh:
+        fh.write(out)
     return str(p)

@@ -160,6 +160,30 @@ def _cmd_master_info(_: argparse.Namespace) -> None:
     h0 = BM.halls()[0]
     print(f"Sample rooms in {h0}:", ", ".join(sorted(list(BM.rooms_in_hall(h0)))[:6]))
 
+def _cmd_bp_audit(args: argparse.Namespace) -> None:
+    from hushdesk.core.engine import run_pdf
+
+    date_str = _parse_date_us(args.date)
+    hall = args.hall or ""
+    payload = run_pdf.run({
+        "mar_path": args.mar,
+        "date_str": date_str,
+        "hall": hall,
+        "room_filters": args.rooms or [],
+        "emit_json": bool(args.emit_json),
+        "out_txt": args.out or "",
+        "summary_only": bool(args.summary_only),
+        "tz": "America/Chicago",
+    })
+    summary = payload["summary"]
+    print(
+        f"Reviewed: {summary['reviewed']} | Hold-Miss: {summary['hold_miss']} | "
+        f"Held-OK: {summary['held_ok']} | Compliant: {summary['compliant']} | DC'D: {summary['dcd']}"
+    )
+    if summary["hold_miss"] > 0:
+        raise SystemExit(2)
+    raise SystemExit(0)
+
 def _cmd_bp_audit_sim(args: argparse.Namespace) -> None:
     payload = run_sim.run_from_fixture(args.fixture)
     summary = payload["summary"]

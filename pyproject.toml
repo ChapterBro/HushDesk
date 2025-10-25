@@ -8,7 +8,9 @@ version = "0.0.0"
 description = "HushDesk placeholder package"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "tzdata>=2024.1; platform_system == \"Windows\"",
+]
 
 [project.scripts]
 hushdesk = "hushdesk.cli:main"
@@ -17,7 +19,7 @@ hushdesk = "hushdesk.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-hushdesk = ["py.typed"]
+hushdesk = ["py.typed", "config/*.json"]
 
 [tool.ruff]
 src = ["src"]

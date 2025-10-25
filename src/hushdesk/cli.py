@@ -4,8 +4,6 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import List, Dict, Tuple
 
-import sys
-
 from hushdesk.core.privacy_runtime import lock_down_process, selfcheck_summary
 from hushdesk.core import building_master as BM
 from hushdesk.core.engine import run_sim
@@ -197,8 +195,8 @@ def _cmd_bp_audit_sim(args: argparse.Namespace) -> None:
             f"DC'D: {summary['dcd']}"
         )
         if summary["hold_miss"] > 0:
-            sys.exit(2)
-        return
+            raise SystemExit(2)
+        raise SystemExit(0)
 
     hall_slug = (header.get("hall", "") or "").lower().replace(" ", "_")
     out_txt = args.out or f"bp_audit_{header.get('date_str','')}_{hall_slug}_sim.txt"
@@ -215,7 +213,8 @@ def _cmd_bp_audit_sim(args: argparse.Namespace) -> None:
     print("JSON:", json_path)
 
     if summary["hold_miss"] > 0:
-        sys.exit(2)
+        raise SystemExit(2)
+    raise SystemExit(0)
 
 def _cmd_privacy_selfcheck(_: argparse.Namespace) -> None:
     print("HushDesk privacy:", selfcheck_summary())

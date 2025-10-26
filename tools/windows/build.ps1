@@ -1,12 +1,12 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
-# --- Paths: repo root is two levels up from this script (tools\windows) ---
-$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+# --- Paths (repo root is parent of tools\windows) ------------------------
+$RepoRoot = (Split-Path -Parent (Split-Path -Parent $PSScriptRoot))
 Set-Location $RepoRoot
 Write-Host "Repo root:" $RepoRoot
 
-# --- Python env ------------------------------------------------------------
+# --- Python env ----------------------------------------------------------
 function Ensure-Venv {
   if (-not (Test-Path ".venv")) {
     if (Get-Command py -ErrorAction SilentlyContinue) {
@@ -17,12 +17,13 @@ function Ensure-Venv {
     }
   }
   . ".\.venv\Scripts\Activate.ps1"
-  python -m pip install -U pip wheel        | Out-Null
-  python -m pip install -e .                | Out-Null
-  python -m pip install pyinstaller tzdata pymupdf | Out-Null
+
+  python -m pip install -U pip wheel                    | Out-Null
+  python -m pip install -e .                            | Out-Null   # hushdesk (editable)
+  python -m pip install pyinstaller tzdata pymupdf      | Out-Null   # packager + tz + fitz
 }
 
-# --- PyInstaller helper ----------------------------------------------------
+# --- PyInstaller helper --------------------------------------------------
 function Build-Exe {
   param(
     [Parameter(Mandatory=$true)][string]$Name,
@@ -35,9 +36,7 @@ function Build-Exe {
     "--clean",
     "--hidden-import", "fitz",
     "--collect-data", "tzdata",
-    "--collect-data", "hushdesk",
     "--add-data", "fixtures;fixtures",
-    "--add-data", "src\hushdesk\config;hushdesk\config",
     "src\hushdesk\win_entry\windows_main.py"
   )
   if ($Console) { $args = @("--console") + $args } else { $args = @("--noconsole") + $args }
@@ -45,7 +44,7 @@ function Build-Exe {
   if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed for $Name" }
 }
 
-# --- Offline smokes (console EXE → proper exit codes) ----------------------
+# --- Offline smokes using the console EXE (checks exit codes) -----------
 function Run-Smokes {
   $cli = ".\dist\HushDeskCLI.exe"
   if (-not (Test-Path $cli)) { throw "Console EXE not found: $cli" }
@@ -54,19 +53,19 @@ function Run-Smokes {
 
   & $cli bp-audit-sim --fixture "fixtures\sample_sim_bridgeman_10-25-2025_dcd_held.json" --summary-only
   $e1 = $LASTEXITCODE
-
   & $cli bp-audit-sim --fixture "fixtures\sample_sim_bridgeman_10-24-2025_dual.json" --summary-only
   $e2 = $LASTEXITCODE
 
   Write-Host ("[SMOKE] dcd_held exit={0} (expect 0), dual exit={1} (expect 2)" -f $e1, $e2)
   if ($e1 -ne 0 -or $e2 -ne 2) {
-    Write-Warning "Unexpected exit codes. Check hushdesk.cli summary-only path or fixtures."
+    Write-Warning "Unexpected exit codes. If dual != 2, check hushdesk.cli --summary-only path or fixtures."
   }
 }
 
-# --- Main ------------------------------------------------------------------
+# --- Main ----------------------------------------------------------------
 Ensure-Venv
 Build-Exe -Name "HushDesk"                    # GUI (no console window)
 Build-Exe -Name "HushDeskCLI" -Console:$true  # Console (stdout + exit codes)
 Run-Smokes
+
 Write-Host "`nBuild done. EXEs in: $RepoRoot\dist"

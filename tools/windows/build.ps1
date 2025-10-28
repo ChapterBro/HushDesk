@@ -24,20 +24,16 @@ function Ensure-Venv {
 }
 
 # --- PyInstaller helper --------------------------------------------------
-function Build-Exe {
-  param(
-    [Parameter(Mandatory=$true)][string]$Name,
-    [switch]$Console = $false
-  )
+function Build-Exe { param([Parameter(Mandatory=$true)][string]$Name, [switch]$Console = $false, [string]$Entry = "$Entry")
   $pyi = ".\.venv\Scripts\pyinstaller.exe"
   $args = @(
-    "--name", $Name,
-    "--onefile",
+    "--name", $Name, "--collect-data","tzdata",
+    "--onefile", "--hidden-import","fitz",
     "--clean",
     "--hidden-import", "fitz",
     "--collect-data", "tzdata",
-    "--add-data", "fixtures;fixtures",
-    "src\hushdesk\win_entry\windows_main.py"
+    "--add-data", "fixtures;fixtures", "--add-data","src\hushdesk\config\building_master.json;hushdesk\config\building_master.json",
+    "$Entry"
   )
   if ($Console) { $args = @("--console") + $args } else { $args = @("--noconsole") + $args }
   & $pyi @args | Out-Host
@@ -64,8 +60,9 @@ function Run-Smokes {
 
 # --- Main ----------------------------------------------------------------
 Ensure-Venv
-Build-Exe -Name "HushDesk"                    # GUI (no console window)
-Build-Exe -Name "HushDeskCLI" -Console:$true  # Console (stdout + exit codes)
+Build-Exe -Name "HushDesk" -Console:$false -Entry "src\hushdesk\win_entry\gui_main.py"
+Build-Exe -Name "HushDeskCLI" -Console:$true  -Entry "src\hushdesk\win_entry\windows_main.py"
 Run-Smokes
 
 Write-Host "`nBuild done. EXEs in: $RepoRoot\dist"
+

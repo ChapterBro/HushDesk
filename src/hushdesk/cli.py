@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 import argparse, datetime as dt
 from dataclasses import asdict
 from pathlib import Path
@@ -96,7 +96,7 @@ def _render_line(record: DecisionRecord) -> str:
             pieces.append(given)
 
     phrase = "; ".join([p for p in pieces if p])
-    return f"{record.room} ({record.time_track}) — {phrase}"
+    return f"{record.room} ({record.time_track}) â€” {phrase}"
 
 def _collect_sections(records: List[DecisionRecord]) -> Tuple[Dict[str, int], DecisionLineSections]:
     counts = {"reviewed": 0, "hold_miss": 0, "held_ok": 0, "compliant": 0, "dcd": 0}
@@ -153,7 +153,7 @@ def _sanitize_for_json(rec: DecisionRecord) -> Dict:
     return data
 
 def _cmd_master_info(_: argparse.Namespace) -> None:
-    print("HushDesk — Building Master")
+    print("HushDesk â€” Building Master")
     print("Halls:", ", ".join(BM.halls()))
     h0 = BM.halls()[0]
     print(f"Sample rooms in {h0}:", ", ".join(sorted(list(BM.rooms_in_hall(h0)))[:6]))
@@ -242,7 +242,7 @@ def main(argv=None) -> None:
     q.add_argument("--emit-json", action="store_true", help="Also write JSON twin")
     q.add_argument("--summary-only", action="store_true", help="Print counts only (no TXT/JSON files)")
     sp.add_parser("privacy-selfcheck", help="Print runtime privacy toggles and exit").set_defaults(func=_cmd_privacy_selfcheck)
-    sp.add_parser("self-check", help="Run privacy + regression self-check").set_defaults(func=lambda _args: self_check_main([]))
+    sp.add_parser("self-check", aliases=["doctor"], help="Run privacy + regression self-check").set_defaults(func=lambda _args: self_check_main([]))
 
     p.set_defaults(func=_cmd_bp_audit)
     q.set_defaults(func=_cmd_bp_audit_sim)
@@ -260,3 +260,4 @@ def main(argv=None) -> None:
 
 if __name__ == "__main__":
     main()
+

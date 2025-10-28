@@ -1,31 +1,53 @@
 ﻿name: ci / syntax-and-sims
 
 on:
-  pull_request:
+  workflow_dispatch:
   push:
     branches: [ release/win-startup-alpha ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: syntax-and-sims-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   syntax-and-sims:
     runs-on: windows-latest
     timeout-minutes: 10
+    env:
+      PYTHONUNBUFFERED: '1'
+      PYTHONPATH: '${{ github.workspace }}\src'
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
-      - name: Install
+      - name: Install runtime deps (no packaging)
         shell: pwsh
         run: |
           python -m pip install -U pip wheel
-          python -m pip install -e .
           python -m pip install tzdata pymupdf pytest
 
-      - name: Syntax
+      - name: Syntax (compile tree)
         shell: pwsh
         run: python -m compileall -q src
+
+      - name: Sanity import hushdesk (src-layout)
+        shell: pwsh
+        run: |
+          python - <<'PY'
+          import sys, os
+          print("PYTHONPATH:", os.environ.get("PYTHONPATH"))
+          import hushdesk
+          print("hushdesk:", hushdesk.__file__)
+          PY
 
       - name: Smokes (sim fixtures)
         shell: pwsh

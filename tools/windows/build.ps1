@@ -78,3 +78,4 @@ Build-Exe -Name "HushDeskCLI" -Console:$true  -Entry "src\hushdesk\win_entry\win
 Run-Smokes
 Write-Host "`nBuild done. EXEs in: $RepoRoot\dist"
 
+

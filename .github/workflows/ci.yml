@@ -1,1 +1,37 @@
-﻿# (paste the YAML here exactly as I sent it)
+﻿name: ci / syntax-and-sims
+
+on:
+  pull_request:
+  push:
+    branches: [ release/win-startup-alpha ]
+
+jobs:
+  syntax-and-sims:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install
+        shell: pwsh
+        run: |
+          python -m pip install -U pip wheel
+          python -m pip install -e .
+          python -m pip install tzdata pymupdf pytest
+
+      - name: Syntax
+        shell: pwsh
+        run: python -m compileall -q src
+
+      - name: Smokes (sim fixtures)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          python -m hushdesk.cli bp-audit-sim --fixture "fixtures\sample_sim_bridgeman_10-25-2025_dcd_held.json" --summary-only
+          if ($LASTEXITCODE -ne 0) { throw "dcd_held should exit 0 (got $LASTEXITCODE)" }
+          python -m hushdesk.cli bp-audit-sim --fixture "fixtures\sample_sim_bridgeman_10-24-2025_dual.json" --summary-only
+          if ($LASTEXITCODE -ne 2) { throw "dual should exit 2 (got $LASTEXITCODE)" }

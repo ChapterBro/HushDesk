@@ -77,3 +77,4 @@ Build-Exe -Name "HushDesk"    -Console:$false -Entry "src\hushdesk\win_entry\gui
 Build-Exe -Name "HushDeskCLI" -Console:$true  -Entry "src\hushdesk\win_entry\windows_main.py"
 Run-Smokes
 Write-Host "`nBuild done. EXEs in: $RepoRoot\dist"
+

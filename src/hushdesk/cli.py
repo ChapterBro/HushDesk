@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 import argparse, datetime as dt
 from dataclasses import asdict
 from pathlib import Path
@@ -96,7 +96,7 @@ def _render_line(record: DecisionRecord) -> str:
             pieces.append(given)
 
     phrase = "; ".join([p for p in pieces if p])
-    return f"{record.room} ({record.time_track}) â€” {phrase}"
+    return f"{record.room} ({record.time_track}) — {phrase}"
 
 def _collect_sections(records: List[DecisionRecord]) -> Tuple[Dict[str, int], DecisionLineSections]:
     counts = {"reviewed": 0, "hold_miss": 0, "held_ok": 0, "compliant": 0, "dcd": 0}
@@ -153,7 +153,7 @@ def _sanitize_for_json(rec: DecisionRecord) -> Dict:
     return data
 
 def _cmd_master_info(_: argparse.Namespace) -> None:
-    print("HushDesk â€” Building Master")
+    print("HushDesk — Building Master")
     print("Halls:", ", ".join(BM.halls()))
     h0 = BM.halls()[0]
     print(f"Sample rooms in {h0}:", ", ".join(sorted(list(BM.rooms_in_hall(h0)))[:6]))
@@ -247,12 +247,7 @@ def main(argv=None) -> None:
     p.set_defaults(func=_cmd_bp_audit)
     q.set_defaults(func=_cmd_bp_audit_sim)
 
-    
-    # doctor (alias of self-check)
-    p = sp.add_parser("doctor", help="system & privacy health (alias of self-check)")
-    p.set_defaults(func=_cmd_self_check)
-
-\1
+    args = ap.parse_args(argv)
     if not hasattr(args, "func"):
         ap.print_help()
         return
@@ -265,4 +260,3 @@ def main(argv=None) -> None:
 
 if __name__ == "__main__":
     main()
-

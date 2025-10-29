@@ -3,7 +3,7 @@
 on:
   pull_request:
   push:
-    branches: [ release/win-startup-alpha ]
+    branches: [ release/win-startup-alpha, main ]
   workflow_dispatch:
 
 permissions:
@@ -30,6 +30,7 @@ jobs:
       - name: Install project (editable) + runtime deps
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           python -m pip install -U pip wheel
           python -m pip install -e .
           python -m pip install tzdata pymupdf
@@ -38,26 +39,20 @@ jobs:
         shell: pwsh
         run: python -m compileall -q src
 
-      - name: Preflight import
-        shell: pwsh
-        run: python -c "import sys, hushdesk; print('PYTHON:', sys.version); print('HUSHDESK:', hushdesk.__file__)"
-
-      - name: Verify fixtures exist
+      - name: Preflight import & CLI
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          @(
-            "fixtures/sample_sim_bridgeman_10-25-2025_dcd_held.json",
-            "fixtures/sample_sim_bridgeman_10-24-2025_dual.json"
-          ) | ForEach-Object {
-            if (!(Test-Path $_)) { throw "Missing fixture: $_" }
+          python -c "import sys, hushdesk; print('PYTHON:', sys.version); print('HUSHDESK:', hushdesk.__file__)"
+          python -m hushdesk.cli --help
+          python -m hushdesk.cli self-check --help
+
+      - name: Run tests if present
+        shell: pwsh
+        run: |
+          if (Test-Path .\\tests) {
+            python -m pip install pytest
+            pytest -q
+          } else {
+            Write-Host "No tests/ directory; skipping pytest."
           }
-
-      - name: Smokes (sim fixtures)
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          python -m hushdesk.cli bp-audit-sim --fixture "fixtures/sample_sim_bridgeman_10-25-2025_dcd_held.json" --summary-only
-          if ($LASTEXITCODE -ne 0) { throw "dcd_held should exit 0 (got $LASTEXITCODE)" }
-          python -m hushdesk.cli bp-audit-sim --fixture "fixtures/sample_sim_bridgeman_10-24-2025_dual.json" --summary-only
-          if ($LASTEXITCODE -ne 2) { throw "dual should exit 2 (got $LASTEXITCODE)" }

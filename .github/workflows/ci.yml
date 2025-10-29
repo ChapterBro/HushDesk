@@ -7,7 +7,6 @@ on:
 
 permissions:
   contents: read
-  statuses: write
 
 concurrency:
   group: syntax-and-sims-${{ github.ref }}
@@ -19,33 +18,16 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 10
     env:
-      PYTHONUNBUFFERED: '1'
-      PYTHONPATH: '${{ github.workspace }}\src'
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: "${{ github.workspace }}\\src"
 
     steps:
       - uses: actions/checkout@v4
 
-      # Create the two exact commit status contexts branch protection expects.
-      - name: Seed required commit statuses (pending)
-        shell: pwsh
-        run: |
-          $h=@{'Authorization'="Bearer $env:GITHUB_TOKEN";'Accept'='application/vnd.github+json'}
-          $repo = "${{ github.repository }}"
-          $sha  = "${{ github.sha }}"
-          $url  = "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          $contexts = @(
-            'ci / syntax-and-sims / syntax-and-sims (push)',
-            'ci / syntax-and-sims / syntax-and-sims (pull_request)'
-          )
-          foreach($ctx in $contexts){
-            $body = @{ state='pending'; context=$ctx; description='Queued'; target_url=$url } | ConvertTo-Json
-            Invoke-RestMethod -Method Post -Uri "https://api.github.com/repos/$repo/statuses/$sha" -Headers $h -Body $body
-          }
-
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: 'pip'
+          python-version: "3.11"
+          cache: "pip"
 
       - name: Install runtime deps (no packaging)
         shell: pwsh
@@ -74,37 +56,3 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "dcd_held should exit 0 (got $LASTEXITCODE)" }
           python -m hushdesk.cli bp-audit-sim --fixture "fixtures\sample_sim_bridgeman_10-24-2025_dual.json" --summary-only
           if ($LASTEXITCODE -ne 2) { throw "dual should exit 2 (got $LASTEXITCODE)" }
-
-      - name: Mark required commit statuses (success)
-        if: ${{ success() }}
-        shell: pwsh
-        run: |
-          $h=@{'Authorization'="Bearer $env:GITHUB_TOKEN";'Accept'='application/vnd.github+json'}
-          $repo = "${{ github.repository }}"
-          $sha  = "${{ github.sha }}"
-          $url  = "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          $contexts = @(
-            'ci / syntax-and-sims / syntax-and-sims (push)',
-            'ci / syntax-and-sims / syntax-and-sims (pull_request)'
-          )
-          foreach($ctx in $contexts){
-            $body = @{ state='success'; context=$ctx; description='Passed'; target_url=$url } | ConvertTo-Json
-            Invoke-RestMethod -Method Post -Uri "https://api.github.com/repos/$repo/statuses/$sha" -Headers $h -Body $body
-          }
-
-      - name: Mark required commit statuses (failure)
-        if: ${{ failure() }}
-        shell: pwsh
-        run: |
-          $h=@{'Authorization'="Bearer $env:GITHUB_TOKEN";'Accept'='application/vnd.github+json'}
-          $repo = "${{ github.repository }}"
-          $sha  = "${{ github.sha }}"
-          $url  = "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          $contexts = @(
-            'ci / syntax-and-sims / syntax-and-sims (push)',
-            'ci / syntax-and-sims / syntax-and-sims (pull_request)'
-          )
-          foreach($ctx in $contexts){
-            $body = @{ state='failure'; context=$ctx; description='Failed'; target_url=$url } | ConvertTo-Json
-            Invoke-RestMethod -Method Post -Uri "https://api.github.com/repos/$repo/statuses/$sha" -Headers $h -Body $body
-          }

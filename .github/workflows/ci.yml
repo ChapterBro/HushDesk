@@ -39,7 +39,17 @@ jobs:
         shell: pwsh
         run: python -m compileall -q src
 
-      # No "sanity import" step needed — smokes will import CLI and fail if imports are broken.
+      # No heredocs. No Bash. Let the sims prove imports work.
+      - name: Verify fixtures exist
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          @(
+            "fixtures\sample_sim_bridgeman_10-25-2025_dcd_held.json",
+            "fixtures\sample_sim_bridgeman_10-24-2025_dual.json"
+          ) | ForEach-Object {
+            if (!(Test-Path $_)) { throw "Missing fixture: $_" }
+          }
 
       - name: Smokes (sim fixtures)
         shell: pwsh

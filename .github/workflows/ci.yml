@@ -1,9 +1,10 @@
 ﻿name: ci / syntax-and-sims
 
 on:
-  workflow_dispatch:
-  push:
   pull_request:
+  push:
+    branches: [ release/win-startup-alpha ]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -17,9 +18,6 @@ jobs:
     name: syntax-and-sims
     runs-on: windows-latest
     timeout-minutes: 10
-    env:
-      PYTHONUNBUFFERED: "1"
-      PYTHONPATH: "${{ github.workspace }}\\src"
 
     steps:
       - uses: actions/checkout@v4
@@ -29,24 +27,28 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Install runtime deps (no packaging)
+      - name: Install project (editable) + runtime deps
         shell: pwsh
         run: |
           python -m pip install -U pip wheel
-          python -m pip install tzdata pymupdf pytest
+          python -m pip install -e .
+          python -m pip install tzdata pymupdf
 
       - name: Syntax (compile tree)
         shell: pwsh
         run: python -m compileall -q src
 
-      # No heredocs. No Bash. Let the sims prove imports work.
+      - name: Preflight import
+        shell: pwsh
+        run: python -c "import sys, hushdesk; print('PYTHON:', sys.version); print('HUSHDESK:', hushdesk.__file__)"
+
       - name: Verify fixtures exist
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           @(
-            "fixtures\sample_sim_bridgeman_10-25-2025_dcd_held.json",
-            "fixtures\sample_sim_bridgeman_10-24-2025_dual.json"
+            "fixtures/sample_sim_bridgeman_10-25-2025_dcd_held.json",
+            "fixtures/sample_sim_bridgeman_10-24-2025_dual.json"
           ) | ForEach-Object {
             if (!(Test-Path $_)) { throw "Missing fixture: $_" }
           }
@@ -55,7 +57,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          python -m hushdesk.cli bp-audit-sim --fixture "fixtures\sample_sim_bridgeman_10-25-2025_dcd_held.json" --summary-only
+          python -m hushdesk.cli bp-audit-sim --fixture "fixtures/sample_sim_bridgeman_10-25-2025_dcd_held.json" --summary-only
           if ($LASTEXITCODE -ne 0) { throw "dcd_held should exit 0 (got $LASTEXITCODE)" }
-          python -m hushdesk.cli bp-audit-sim --fixture "fixtures\sample_sim_bridgeman_10-24-2025_dual.json" --summary-only
+          python -m hushdesk.cli bp-audit-sim --fixture "fixtures/sample_sim_bridgeman_10-24-2025_dual.json" --summary-only
           if ($LASTEXITCODE -ne 2) { throw "dual should exit 2 (got $LASTEXITCODE)" }

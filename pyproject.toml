@@ -1,34 +1,15 @@
-[build-system]
-requires = ["setuptools>=68"]
+﻿[build-system]
+requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "hushdesk"
 version = "0.0.0"
-description = "HushDesk placeholder package"
-readme = "README.md"
-requires-python = ">=3.11"
-dependencies = [
-    "tzdata>=2024.1; platform_system == \"Windows\"",
-]
+description = "HushDesk tools (src-layout); installable for CI"
+requires-python = ">=3.10"
 
-[project.scripts]
-hushdesk = "hushdesk.cli:main"
+[tool.setuptools]
+package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.setuptools.package-data]
-hushdesk = ["py.typed", "config/*.json"]
-
-[tool.ruff]
-src = ["src"]
-target-version = "py311"
-
-[tool.mypy]
-python_version = "3.11"
-packages = ["hushdesk"]
-
-[tool.pytest.ini_options]
-pythonpath = ["src"]
-testpaths = ["tests"]

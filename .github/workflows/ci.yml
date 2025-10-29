@@ -39,14 +39,7 @@ jobs:
         shell: pwsh
         run: python -m compileall -q src
 
-      - name: Sanity import hushdesk (src-layout)
-        shell: pwsh
-        run: |
-          python - <<'PY'
-          import os, hushdesk
-          print("PYTHONPATH:", os.environ.get("PYTHONPATH"))
-          print("hushdesk module from:", hushdesk.__file__)
-          PY
+      # No "sanity import" step needed — smokes will import CLI and fail if imports are broken.
 
       - name: Smokes (sim fixtures)
         shell: pwsh

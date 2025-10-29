@@ -32,7 +32,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           python -m pip install -U pip wheel
-          python -m pip install -e .
+          python -m pip install -e .[dev]
           python -m pip install tzdata pymupdf
 
       - name: Syntax (compile tree)
@@ -56,3 +56,4 @@ jobs:
           } else {
             Write-Host "No tests/ directory; skipping pytest."
           }
+

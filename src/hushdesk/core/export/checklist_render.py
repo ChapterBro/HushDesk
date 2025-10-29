@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 from typing import Dict, List
 from hushdesk.core.privacy_runtime import ensure_private_dir, secure_open_for_write
+from hushdesk.version import APP_VERSION
 
 # try to import scrubber (no-op fallback if unavailable)
 try:
@@ -52,7 +53,7 @@ def write_txt(path: str, header: Dict, summary: Dict, sections: Dict[str, List[s
     # Central timestamp (America/Chicago fixed offset stamp)
     from datetime import datetime, timezone, timedelta
     central = datetime.now(tz=timezone(timedelta(hours=-5))).strftime("%m-%d-%Y %H:%M")
-    lines.append(f"Generated: {central} (Central)")
+    lines.append(f"Generated: {central} (Central) • v{APP_VERSION}")
 
     out = "\n".join(lines) + "\n"
     p = Path(path)

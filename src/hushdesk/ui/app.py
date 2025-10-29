@@ -1,25 +1,30 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 import os
 import re
 import threading
 import time
+import sys
+import importlib
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD  # type: ignore
 
-    _HAS_DND = True
+    _DND_OK = True
 except Exception:  # pragma: no cover - optional dependency
-    _HAS_DND = False
+    DND_FILES = None  # type: ignore[assignment]
+    TkinterDnD = None  # type: ignore[assignment]
+    _DND_OK = False
 
 from hushdesk.ui.theme import load_theme_name, save_theme_name, select_palette
 from hushdesk.ui.util import hall_from_rooms
+from hushdesk.pdf.backends import PdfUnavailable, get_backend
 from hushdesk.core.engine import run_sim
-
-USE_PDF_BACKEND = False  # future switch
+from hushdesk.core import building_master as BM
+from hushdesk.version import APP_VERSION
 
 
 def run_simulation(fixture_path: str, room_pattern: str | None = None) -> dict:
@@ -51,11 +56,12 @@ def run_simulation(fixture_path: str, room_pattern: str | None = None) -> dict:
 
 
 def run_pdf_backend(pdf_path: str, date_str: str, room_filter: str | None) -> dict:  # pragma: no cover - placeholder
-    if not USE_PDF_BACKEND:
-        raise RuntimeError("PDF backend disabled in this build.")
-    from hushdesk.core.engine import run_pdf  # type: ignore
+    from hushdesk.core.engine import run_pdf  # type: ignore[attr-defined]
 
-    return run_pdf.run_on_pdf(pdf_path, date_str=date_str, room_filter=room_filter)
+    runner = getattr(run_pdf, "run_on_pdf", None)
+    if runner is None:
+        raise PdfUnavailable("engine_missing")
+    return runner(pdf_path, date_str=date_str, room_filter=room_filter)
 
 
 class HushDeskApp:
@@ -68,7 +74,17 @@ class HushDeskApp:
             "hall": None,
             "last_payload": None,
             "last_summary": {"reviewed": 0, "hold_miss": 0, "held_ok": 0, "compliant": 0, "dcd": 0},
+            "pdf_backend": None,
+            "hall_override": None,
+            "detected_hall": None,
+            "detected_hall_num": None,
         }
+        self._pdf_helper_dialog: Optional[tk.Toplevel] = None
+        self._updating_hall_entry = False
+        self._suppress_hall_events = False
+        self._hall_choices = BM.halls()
+        self._bridgeman_fixture_cache: Optional[Path] = None
+        self._preflight_status = self._compute_preflight_status()
 
         self._apply_theme()
         self._build_ui()
@@ -110,31 +126,53 @@ class HushDeskApp:
 
         # Header card ---------------------------------------------------
         self.audit_date_var = tk.StringVar(value="Audit Date: (select MAR)")
-        self.hall_var = tk.StringVar(value="Hall: —")
+        self.hall_var = tk.StringVar(value="Hall not found in header. Type it or pick below.")
 
         header = ttk.Frame(self.root, style="Card.TFrame")
         header.pack(fill="x", padx=12, pady=(4, 8))
         ttk.Label(header, textvariable=self.audit_date_var, font=("Segoe UI", 18, "bold")).grid(row=0, column=0, sticky="w", padx=12, pady=(12, 2))
         ttk.Label(header, textvariable=self.hall_var, style="Muted.TLabel").grid(row=1, column=0, sticky="w", padx=12)
 
+        hall_edit = tk.Frame(header, bg=p["bg"])
+        hall_edit.grid(row=2, column=0, columnspan=2, sticky="w", padx=12, pady=(6, 12))
+        ttk.Label(hall_edit, text="Hall override", style="Muted.TLabel").pack(side="left")
+        self.hall_entry_var = tk.StringVar()
+        self.hall_entry_var.trace_add("write", self._on_hall_entry_changed)
+        self.hall_entry = ttk.Entry(hall_edit, textvariable=self.hall_entry_var, width=18)
+        self.hall_entry.pack(side="left", padx=(6, 6))
+        self.hall_combo = ttk.Combobox(
+            hall_edit,
+            values=self._hall_choices,
+            state="readonly",
+            width=18,
+        )
+        self.hall_combo.bind("<<ComboboxSelected>>", self._on_hall_combo_selected)
+        self.hall_combo.pack(side="left")
+
         file_frame = ttk.Frame(header, style="Card.TFrame")
-        file_frame.grid(row=0, column=1, rowspan=2, sticky="ew", padx=12, pady=12)
+        file_frame.grid(row=0, column=1, rowspan=3, sticky="ew", padx=12, pady=12)
         header.grid_columnconfigure(1, weight=1)
         ttk.Label(file_frame, text="MAR PDF or Fixture", style="Muted.TLabel").pack(anchor="w", padx=12, pady=(8, 2))
-        self.file_var = tk.StringVar(value="(none)")
+        self.file_var = tk.StringVar(value="Drop a MAR PDF or fixture to get started.")
         file_row = tk.Frame(file_frame, bg=p.get("surface", p["bg"]))
         file_row.pack(fill="x", padx=12, pady=(0, 12))
-        ttk.Label(file_row, textvariable=self.file_var).pack(side="left")
-        ttk.Button(file_row, text="Browse…", command=self._browse_file).pack(side="right")
-        if _HAS_DND:
+        self.file_entry = ttk.Entry(file_row, textvariable=self.file_var, width=70)
+        self.file_entry.pack(side="left", fill="x", expand=True)
+        ttk.Button(file_row, text="Browse…", command=self._on_browse_clicked).pack(side="right", padx=(8, 0))
+        if _DND_OK and DND_FILES is not None:
             try:
-                self.root.drop_target_register(DND_FILES)
-                self.root.dnd_bind("<<Drop>>", self._on_drop_files)
+                self.file_entry.drop_target_register(DND_FILES)
+                self.file_entry.dnd_bind("<<Drop>>", self._on_drop_files)
             except Exception:
+                pass
                 pass
 
         self.banner = ttk.Frame(self.root, style="Banner.TFrame")
-        self.banner_msg = ttk.Label(self.banner, text="Hall couldn’t be confirmed.", style="Banner.TLabel")
+        self.banner_msg = ttk.Label(
+            self.banner,
+            text="Hall not found in header. Type it or pick below.",
+            style="Banner.TLabel",
+        )
         self.banner_msg.pack(padx=12, pady=6)
         self.banner.pack_forget()
 
@@ -146,7 +184,11 @@ class HushDeskApp:
         self.quick_menu = ttk.Menubutton(run_row, text="Quick Actions")
         qm = tk.Menu(self.quick_menu, tearoff=0)
         qm.add_command(label="Quick Check", command=self._quick_check)
+        load_fixture_menu = tk.Menu(qm, tearoff=0)
+        load_fixture_menu.add_command(label="Bridgeman (sample)", command=self._load_bridgeman_sample)
+        qm.add_cascade(label="Load Fixture", menu=load_fixture_menu)
         self.quick_menu["menu"] = qm
+        self._quick_actions_menu = qm
         self.quick_menu.pack(side="left", padx=(8, 0))
 
         filter_box = tk.Frame(run_row, bg=p["bg"])
@@ -198,9 +240,19 @@ class HushDeskApp:
         # Footer --------------------------------------------------------
         footer = tk.Frame(self.root, bg=p["bg"])
         footer.pack(fill="x", padx=12, pady=(4, 8))
-        self.footer_time = ttk.Label(footer, text="Time: —", style="Muted.TLabel")
-        self.footer_time.pack(side="left")
-        ttk.Button(footer, text="Safety: On", command=self._show_safety).pack(side="right")
+
+        info_row = tk.Frame(footer, bg=p["bg"])
+        info_row.pack(fill="x")
+        self.footer_info_var = tk.StringVar(value=self._footer_info_text())
+        ttk.Label(info_row, textvariable=self.footer_info_var, style="Muted.TLabel").pack(side="left")
+        ttk.Button(info_row, text="Safety info", command=self._show_safety).pack(side="right")
+
+        status_row = tk.Frame(footer, bg=p["bg"])
+        status_row.pack(fill="x", pady=(2, 0))
+        self.preflight_var = tk.StringVar(value=self._format_preflight_status())
+        ttk.Label(status_row, textvariable=self.preflight_var, style="Muted.TLabel").pack(side="left")
+        self.footer_time = ttk.Label(status_row, text="Time: —", style="Muted.TLabel")
+        self.footer_time.pack(side="right")
 
         self._set_summary(self.state["last_summary"])
 
@@ -256,24 +308,167 @@ class HushDeskApp:
             "• Encryption at rest is planned.",
         )
 
+    def _show_pdf_missing_dialog(self) -> None:
+        existing = getattr(self, "_pdf_helper_dialog", None)
+        try:
+            if existing is not None and existing.winfo_exists():
+                existing.lift()
+                existing.focus_set()
+                return
+        except Exception:
+            self._pdf_helper_dialog = None
+
+        top = tk.Toplevel(self.root)
+        self._pdf_helper_dialog = top
+        top.title("Can't read this MAR yet")
+        top.transient(self.root)
+        top.grab_set()
+        top.resizable(False, False)
+        palette = self.palette
+        top.configure(bg=palette["bg"])
+        top.protocol("WM_DELETE_WINDOW", self._close_pdf_helper_dialog)
+
+        frame = tk.Frame(top, bg=palette["bg"])
+        frame.pack(padx=22, pady=20)
+
+        body = (
+            "This build doesn’t have the PDF reader bundled.\n"
+            "Try now: Load a sample Fixture (no PHI) from Quick Actions to see HushDesk work.\n"
+            "Next build: include the PDF reader so real MARs open normally."
+        )
+        tk.Label(
+            frame,
+            text=body,
+            justify="left",
+            wraplength=520,
+            bg=palette["bg"],
+            fg=palette["text"],
+        ).pack(anchor="w", pady=(0, 18))
+
+        buttons = tk.Frame(frame, bg=palette["bg"])
+        buttons.pack(fill="x")
+        ttk.Button(buttons, text="Open Quick Actions", command=self._handle_pdf_missing_quick_actions).pack(
+            side="left"
+        )
+        ttk.Button(buttons, text="OK", command=self._close_pdf_helper_dialog).pack(side="right")
+
+    def _close_pdf_helper_dialog(self) -> None:
+        dialog = getattr(self, "_pdf_helper_dialog", None)
+        if dialog is not None:
+            try:
+                dialog.grab_release()
+            except Exception:
+                pass
+            if dialog.winfo_exists():
+                dialog.destroy()
+        self._pdf_helper_dialog = None
+
+    def _handle_pdf_missing_quick_actions(self) -> None:
+        self._close_pdf_helper_dialog()
+        def _launch():
+            if not self._load_bridgeman_sample():
+                self._open_quick_actions_menu()
+        self.root.after(50, _launch)
+
+    def _open_quick_actions_menu(self) -> None:
+        menu = getattr(self, "_quick_actions_menu", None)
+        btn = getattr(self, "quick_menu", None)
+        if not menu or not btn:
+            return
+        try:
+            x = btn.winfo_rootx()
+            y = btn.winfo_rooty() + btn.winfo_height()
+            menu.tk_popup(x, y)
+        except Exception:
+            pass
+        finally:
+            try:
+                menu.grab_release()
+            except Exception:
+                pass
+
+    def _resolve_bridgeman_fixture(self) -> Optional[Path]:
+        if self._bridgeman_fixture_cache and self._bridgeman_fixture_cache.exists():
+            return self._bridgeman_fixture_cache
+        candidates: List[Path] = []
+        base_meipass = getattr(sys, "_MEIPASS", None)
+        if base_meipass:
+            meipass_path = Path(base_meipass)
+            candidates.extend(
+                [
+                    meipass_path / "fixtures" / "bridgeman_sample.json",
+                    meipass_path / "hushdesk" / "fixtures" / "bridgeman_sample.json",
+                ]
+            )
+        project_root = Path(__file__).resolve().parents[3]
+        candidates.append(project_root / "fixtures" / "bridgeman_sample.json")
+        candidates.append(Path.cwd() / "fixtures" / "bridgeman_sample.json")
+        for cand in candidates:
+            if cand.exists():
+                self._bridgeman_fixture_cache = cand
+                return cand
+        self._bridgeman_fixture_cache = None
+        return None
+
+    def _load_bridgeman_sample(self) -> bool:
+        path = self._resolve_bridgeman_fixture()
+        if not path:
+            messagebox.showerror("HushDesk", "Sample fixture not bundled in this build.")
+            return False
+        self._on_file_chosen(str(path))
+        self.root.after(100, self._quick_check)
+        return True
+
     # ------------------------------------------------------------------
     # File selection
     def _on_drop_files(self, event) -> None:  # type: ignore[override]
-        files = self.root.splitlist(event.data)
-        if files:
-            self._set_file(Path(files[0]))
+        data = getattr(event, "data", "")
+        try:
+            paths = self.root.tk.splitlist(data)
+        except Exception:
+            paths = []
+        if not paths:
+            return
+        dropped = paths[0].strip()
+        if dropped.startswith("{") and dropped.endswith("}"):
+            dropped = dropped[1:-1]
+        dropped = dropped.strip().strip('"')
+        if not dropped:
+            return
+        self._on_file_chosen(dropped)
 
-    def _browse_file(self) -> None:
+    def _on_browse_clicked(self) -> None:
         path = filedialog.askopenfilename(
             title="Select MAR PDF or fixture",
-            filetypes=[("JSON fixtures", "*.json"), ("PDF files", "*.pdf"), ("All files", "*.*")],
+            filetypes=[("MAR PDF/Fixture", "*.pdf *.json"), ("PDF files", "*.pdf"), ("Fixture JSON", "*.json")],
         )
         if path:
-            self._set_file(Path(path))
+            self._on_file_chosen(path)
+
+    def _on_file_chosen(self, raw_path: str) -> None:
+        candidate = raw_path.strip()
+        if not candidate:
+            return
+        path_text = candidate
+        if path_text.startswith("{") and path_text.endswith("}"):
+            path_text = path_text[1:-1]
+        path_text = path_text.strip().strip('"')
+        path = Path(path_text)
+        if path.is_dir():
+            messagebox.showwarning("HushDesk", "Drop a file, not a folder.")
+            return
+        if not path.exists():
+            messagebox.showwarning("HushDesk", "That file could not be found.")
+            return
+        if path.suffix.lower() not in {".pdf", ".json"}:
+            messagebox.showwarning("HushDesk", "Unsupported file type. Use a MAR PDF or fixture JSON.")
+            return
+        self._set_file(path)
 
     def _set_file(self, path: Path) -> None:
         self.state["file"] = path
-        self.file_var.set(path.name)
+        self.state["pdf_backend"] = None
+        self.file_var.set(str(path))
         rooms: List[str] = []
         date_display: Optional[str] = None
         if path.suffix.lower() == ".json":
@@ -284,16 +479,121 @@ class HushDeskApp:
             except Exception:
                 rooms = []
         hall, hall_num = hall_from_rooms(rooms)
-        if hall and hall_num:
-            self.hall_var.set(f"Hall: {hall_num} (auto)")
-            self.banner.pack_forget()
-        else:
-            self.hall_var.set("Hall: —")
-            self.banner.pack(fill="x", padx=12, pady=(0, 8))
+        self._refresh_hall_status(hall, hall_num)
         if date_display:
             self.audit_date_var.set(f"Audit Date: {date_display} (Central)")
         else:
             self.audit_date_var.set("Audit Date: (select date)")
+
+    def _set_hall_entry_text(self, value: str) -> None:
+        self._suppress_hall_events = True
+        try:
+            self.hall_entry_var.set(value or "")
+        finally:
+            self._suppress_hall_events = False
+
+    def _set_hall_combo_value(self, value: str) -> None:
+        self._suppress_hall_events = True
+        try:
+            if value and value in self._hall_choices:
+                self.hall_combo.set(value)
+            elif not value:
+                self.hall_combo.set("")
+        finally:
+            self._suppress_hall_events = False
+
+    def _on_hall_entry_changed(self, *_args) -> None:
+        if self._suppress_hall_events:
+            return
+        value = self.hall_entry_var.get().strip()
+        self.state["hall_override"] = value or None
+        self._refresh_hall_status(self.state.get("detected_hall"), self.state.get("detected_hall_num"))
+        self._update_cached_payload_hall()
+
+    def _on_hall_combo_selected(self, _event) -> None:
+        value = self.hall_combo.get().strip()
+        self._set_hall_entry_text(value)
+        if not self._suppress_hall_events:
+            self.state["hall_override"] = value or None
+            self._refresh_hall_status(self.state.get("detected_hall"), self.state.get("detected_hall_num"))
+            self._update_cached_payload_hall()
+
+    def _refresh_hall_status(self, detected_hall: Optional[str], detected_hall_num: Optional[int | str]) -> None:
+        self.state["detected_hall"] = detected_hall
+        self.state["detected_hall_num"] = detected_hall_num
+        override = (self.state.get("hall_override") or "").strip()
+        if override:
+            self.hall_var.set(f"Hall: {override} (chosen)")
+            self._set_hall_entry_text(override)
+            self._set_hall_combo_value(override)
+            self.banner.pack_forget()
+        elif detected_hall and detected_hall_num:
+            self.hall_var.set(f"Hall: {detected_hall_num} (auto)")
+            self._set_hall_entry_text(detected_hall)
+            self._set_hall_combo_value(detected_hall)
+            self.banner.pack_forget()
+        else:
+            message = "Hall not found in header. Type it or pick below."
+            self.hall_var.set(message)
+            self.banner_msg.configure(text=message)
+            self.banner.pack(fill="x", padx=12, pady=(0, 8))
+            if not override:
+                self._set_hall_entry_text("")
+                self._set_hall_combo_value("")
+        current = override or detected_hall or ""
+        self.state["hall"] = current or None
+        self._update_cached_payload_hall()
+
+    def _probe_module(self, module: str) -> bool:
+        try:
+            importlib.import_module(module)
+            return True
+        except Exception:
+            return False
+
+    def _compute_preflight_status(self) -> Dict[str, bool]:
+        return {
+            "mupdf": self._probe_module("fitz"),
+            "pdfplumber": self._probe_module("pdfplumber"),
+            "dnd": bool(_DND_OK),
+        }
+
+    def _format_preflight_status(self) -> str:
+        status = self._preflight_status
+        check = lambda ok: "✓" if ok else "✗"
+        return (
+            f"PDF: MuPDF {check(status.get('mupdf', False))} | "
+            f"Fallback {check(status.get('pdfplumber', False))} | "
+            f"DnD {check(status.get('dnd', False))} | Safety: On"
+        )
+
+    def _footer_info_text(self) -> str:
+        return f"v{APP_VERSION} • America/Chicago • Safety: On"
+
+    def _ensure_pdf_backend(self, path: Path):
+        backend = get_backend()
+        try:
+            doc = backend.open(str(path))
+        except Exception as exc:
+            raise RuntimeError("HushDesk couldn't open that MAR PDF.") from exc
+        close = getattr(doc, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+        return backend
+
+    def _run_pdf_pipeline(self, path: Path, backend: Any, room_pattern: str | None) -> dict:
+        backend_name = getattr(backend, "name", "pdf")
+        self.state["pdf_backend"] = backend_name
+        if backend_name == "mupdf":
+            self._preflight_status["mupdf"] = True
+        elif backend_name.startswith("pdf"):
+            self._preflight_status["pdfplumber"] = True
+        if hasattr(self, "preflight_var"):
+            self.preflight_var.set(self._format_preflight_status())
+        return run_pdf_backend(str(path), date_str="", room_filter=room_pattern)
 
     # ------------------------------------------------------------------
     # Rendering helpers
@@ -388,21 +688,52 @@ class HushDeskApp:
         if not path:
             raise RuntimeError("Select a MAR (PDF or fixture) first.")
         room_pattern = self.filter_var.get().strip() or None
-        if path.suffix.lower() == ".json":
+        suffix = path.suffix.lower()
+        if suffix == ".json":
             payload = run_simulation(str(path), room_pattern)
+        elif suffix == ".pdf":
+            backend = self._ensure_pdf_backend(path)
+            payload = self._run_pdf_pipeline(path, backend, room_pattern)
         else:
-            payload = run_pdf_backend(str(path), date_str="", room_filter=room_pattern)
+            raise RuntimeError("Unsupported file type. Use a MAR PDF or fixture JSON.")
+        self._apply_hall_override_to_payload(payload)
         return payload
 
+    def _current_hall_value(self) -> str:
+        override = (self.state.get("hall_override") or "").strip()
+        if override:
+            return override
+        detected = self.state.get("detected_hall")
+        return (detected or "").strip()
+
+    def _update_cached_payload_hall(self) -> None:
+        payload = self.state.get("last_payload")
+        if not payload:
+            return
+        hall_value = self._current_hall_value()
+        header = payload.setdefault("header", {})
+        if hall_value:
+            header["hall"] = hall_value
+        else:
+            header.pop("hall", None)
+
+    def _apply_hall_override_to_payload(self, payload: dict) -> None:
+        header = payload.setdefault("header", {})
+        hall_value = (self.state.get("hall_override") or "").strip()
+        if not hall_value:
+            hall_value = (header.get("hall") or self.state.get("detected_hall") or "").strip()
+        if hall_value:
+            header["hall"] = hall_value
+            self.state["hall"] = hall_value
+        else:
+            header.pop("hall", None)
+        self._update_cached_payload_hall()
     def _update_header_from_payload(self, payload: dict) -> None:
         rooms = payload.get("rooms", [])
         hall, hall_num = hall_from_rooms(rooms)
-        if hall_num:
-            self.hall_var.set(f"Hall: {hall_num} (auto)")
-            self.banner.pack_forget()
-        else:
-            self.hall_var.set("Hall: —")
-            self.banner.pack(fill="x", padx=12, pady=(0, 8))
+        header_hall = (payload.get("header") or {}).get("hall")
+        detected = header_hall or hall
+        self._refresh_hall_status(detected, hall_num)
         self.audit_date_var.set(f"Audit Date: {payload['header']['date_str']} (Central)")
 
     def _after_start(self, text: str, mode: str) -> None:
@@ -434,6 +765,9 @@ class HushDeskApp:
             start = time.time()
             try:
                 payload = self._compute_payload()
+            except PdfUnavailable:
+                self.state["pdf_backend"] = None
+                self.root.after(0, self._show_pdf_missing_dialog)
             except Exception as exc:  # relay to UI
                 self.root.after(0, lambda: messagebox.showerror("HushDesk", f"Quick Check failed:\n{exc}"))
             else:
@@ -463,6 +797,11 @@ class HushDeskApp:
             start = time.time()
             try:
                 payload = self._compute_payload()
+            except PdfUnavailable:
+                self.state["pdf_backend"] = None
+                self.root.after(0, self._show_pdf_missing_dialog)
+                self.root.after(0, self._after_finish)
+                return
             except Exception as exc:
                 self.root.after(0, lambda: messagebox.showerror("HushDesk", f"Run Audit failed:\n{exc}"))
                 self.root.after(0, self._after_finish)
@@ -539,7 +878,7 @@ class HushDeskApp:
 
 
 def main() -> None:  # pragma: no cover - UI entry point
-    root_cls = TkinterDnD.Tk if _HAS_DND else tk.Tk  # type: ignore
+    root_cls = (TkinterDnD.Tk if (_DND_OK and TkinterDnD is not None) else tk.Tk)  # type: ignore
     root = root_cls()
     app = HushDeskApp(root)
     root.mainloop()
@@ -547,3 +886,6 @@ def main() -> None:  # pragma: no cover - UI entry point
 
 if __name__ == "__main__":  # pragma: no cover
     main()
+
+
+

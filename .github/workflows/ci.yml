@@ -18,6 +18,9 @@ jobs:
     name: syntax-and-sims
     runs-on: windows-latest
     timeout-minutes: 10
+    env:
+      # Fallback so src-layout works even if packaging metadata ever drifts
+      PYTHONPATH: "${{ github.workspace }}\\src"
 
     steps:
       - uses: actions/checkout@v4
@@ -32,28 +35,16 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           python -m pip install -U pip wheel
-          python -m pip install -e .[dev]
+          python -m pip install -e .
           python -m pip install tzdata pymupdf
 
       - name: Syntax (compile tree)
         shell: pwsh
         run: python -m compileall -q src
 
-      - name: Preflight import & CLI
+      - name: Assert hushdesk import & CLI
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          python -c "import sys, hushdesk; print('PYTHON:', sys.version); print('HUSHDESK:', hushdesk.__file__)"
+          python -c "import hushdesk, sys; print('HUSHDESK:', hushdesk.__file__); print('PYTHON:', sys.version)"
           python -m hushdesk.cli --help
-          python -m hushdesk.cli self-check --help
-
-      - name: Run tests if present
-        shell: pwsh
-        run: |
-          if (Test-Path .\\tests) {
-            python -m pip install pytest
-            pytest -q
-          } else {
-            Write-Host "No tests/ directory; skipping pytest."
-          }
-

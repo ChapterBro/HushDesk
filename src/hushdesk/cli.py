@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 import argparse, datetime as dt
 from dataclasses import asdict
 from pathlib import Path
@@ -242,7 +242,7 @@ def main(argv=None) -> None:
     q.add_argument("--emit-json", action="store_true", help="Also write JSON twin")
     q.add_argument("--summary-only", action="store_true", help="Print counts only (no TXT/JSON files)")
     sp.add_parser("privacy-selfcheck", help="Print runtime privacy toggles and exit").set_defaults(func=_cmd_privacy_selfcheck)
-    sp.add_parser("self-check", help="Run privacy + regression self-check").set_defaults(func=lambda _args: self_check_main([]))
+    sp.add_parser("self-check", aliases=["doctor"], help="Run privacy + regression self-check").set_defaults(func=lambda _args: self_check_main([]))
 
     p.set_defaults(func=_cmd_bp_audit)
     q.set_defaults(func=_cmd_bp_audit_sim)
@@ -260,3 +260,5 @@ def main(argv=None) -> None:
 
 if __name__ == "__main__":
     main()
+
+

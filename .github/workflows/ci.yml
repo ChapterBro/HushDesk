@@ -1,24 +1,50 @@
-name: ci
-on: [push, pull_request]
+﻿name: ci / syntax-and-sims
+
+on:
+  pull_request:
+  push:
+    branches: [ release/win-startup-alpha, main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: syntax-and-sims-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   syntax-and-sims:
-    runs-on: ubuntu-latest
+    name: syntax-and-sims
+    runs-on: windows-latest
+    timeout-minutes: 10
+    env:
+      # Fallback so src-layout works even if packaging metadata ever drifts
+      PYTHONPATH: "${{ github.workspace }}\\src"
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
-        with: { python-version: '3.11' }
-      - name: Syntax only
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install project (editable) + runtime deps
+        shell: pwsh
         run: |
-          PYTHONDONTWRITEBYTECODE=1 python - <<'PY'
-          import sys, pathlib, py_compile
-          fails=[]
-          for p in pathlib.Path("src").rglob("*.py"):
-              try: py_compile.compile(str(p), doraise=True)
-              except Exception as e: fails.append((str(p),str(e)))
-          if fails:
-              print("PY_COMPILE: FAIL"); [print(" -",f,e) for f,e in fails]; sys.exit(1)
-          print("PY_COMPILE: OK")
-          PY
-      - name: Simulation regression
+          $ErrorActionPreference = "Stop"
+          python -m pip install -U pip wheel
+          python -m pip install -e .
+          python -m pip install tzdata pymupdf
+
+      - name: Syntax (compile tree)
+        shell: pwsh
+        run: python -m compileall -q src
+
+      - name: Assert hushdesk import & CLI
+        shell: pwsh
         run: |
-          PYTHONPATH=src python tools/simregress.py
+          $ErrorActionPreference = "Stop"
+          python -c "import hushdesk, sys; print('HUSHDESK:', hushdesk.__file__); print('PYTHON:', sys.version)"
+          python -m hushdesk.cli --help

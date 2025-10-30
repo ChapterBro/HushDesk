@@ -1,0 +1,13 @@
+{
+  "meta": { "pages": 2, "source": "synthetic", "canon_version": "v1", "engine": "fixture" },
+  "rows": [
+    { "room":"101A","medication":"Med One","am":{"time":"08:00","given":true,"raw":"08:00 ✓"},"pm":{"time":"20:00","given":false,"raw":"20:00 !"} },
+    { "room":"102B","medication":"Med Two","am":{"time":"08:00","given":true,"raw":"08:00 ✓"},"pm":{"time":null,"given":false,"raw":"—"} },
+    { "room":"201A","medication":"Med Three","am":{"time":"06:00","given":true,"raw":"06:00 ✓"},"pm":{"time":"18:00","given":true,"raw":"18:00 ✓"} },
+    { "room":"202B","medication":"Med Four","am":{"time":null,"given":false,"raw":"—"},"pm":{"time":"22:00","given":false,"raw":"22:00 !"} }
+  ],
+  "violations": [
+    { "room":"101A","slot":"PM","code":"missing_check" },
+    { "room":"202B","slot":"PM","code":"missing_check" }
+  ]
+}

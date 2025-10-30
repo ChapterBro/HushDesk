@@ -107,6 +107,8 @@ def write_ship_report(
     fixture_summary: Dict[str, int],
     txt_path: Path | None,
     build_path: Path,
+    phrase_status: str,
+    phrase_results: Dict[str, str],
 ) -> None:
     tick = lambda ok: "✓" if ok else "✗"
     timestamp = datetime.now(timezone.utc).astimezone().isoformat()
@@ -123,6 +125,15 @@ def write_ship_report(
         f"- TXT output: {txt_path if txt_path else 'not generated'}",
         f"- Build artifact: {build_path} ({'present' if build_path.exists() else 'missing'})",
     ]
+    lines.extend(
+        [
+            "",
+            "### Rules Phrase Support",
+            f"Status: {phrase_status}",
+            "Samples:",
+            json.dumps(phrase_results, sort_keys=True),
+        ]
+    )
     Path("SHIP_REPORT.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -140,6 +151,22 @@ def main() -> None:
 
     build_path = Path("dist") / "HushDesk" / "HushDesk.exe"
 
+    # --- Rules phrase acceptance (headless) ---
+    try:
+        from hushdesk.core.rules.langmap import normalize_rule_text
+
+        samples = {
+            "Hold if SBP less than 90": "SBP < 90",
+            "Hold SBP greater than 180": "SBP > 180",
+            "Hold if Pulse less than 60": "HR < 60",
+        }
+        phrase_results = {s: normalize_rule_text(s) for s in samples}
+        phrase_ok = all(exp in phrase_results[src] for src, exp in samples.items())
+        phrase_status = "OK" if phrase_ok else "FAIL"
+    except Exception as e:
+        phrase_results = {"error": str(e)}
+        phrase_status = "ERROR"
+
     write_ship_report(
         compile_ok,
         preflight,
@@ -148,6 +175,8 @@ def main() -> None:
         fixture_summary,
         txt_path,
         build_path,
+        phrase_status,
+        phrase_results,
     )
 
 

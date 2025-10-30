@@ -1,0 +1,2 @@
+﻿include src/hushdesk/config/building_master.json
+include src/hushdesk/fixtures/bridgeman_sample.json

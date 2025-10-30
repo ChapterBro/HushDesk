@@ -1,4 +1,4 @@
-﻿import os, sys, importlib, traceback
+import os, sys, importlib, traceback
 from multiprocessing import freeze_support
 
 def _prefer(names, module):

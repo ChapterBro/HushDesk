@@ -3,6 +3,8 @@ import re
 from dataclasses import dataclass
 from typing import List, Literal
 
+from hushdesk.core.rules.langmap import normalize_rule_text
+
 Metric = Literal["SBP","HR"]
 
 @dataclass(frozen=True)
@@ -20,6 +22,7 @@ _HR_GT  = re.compile(r"\b(HR|Pulse)\b.*?(?:if\s+)?(?:(?:above|greater\s+than)|>)
 def parse_strict_rules(text: str) -> List[Rule]:
     rules: List[Rule] = []
     for line in text.splitlines():
+        line = normalize_rule_text(line)
         if _DISALLOWED.search(line): continue
         if (m := _SBP_LT.search(line)): rules.append(Rule("SBP","<", int(m.group(1))))
         if (m := _SBP_GT.search(line)): rules.append(Rule("SBP",">", int(m.group(1))))

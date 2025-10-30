@@ -25,24 +25,24 @@ def _lines_for_groups(records: List[DecisionRecord]) -> Dict[str, List[str]]:
             hr = measured.get("hr")
             if sbp is not None and dbp is not None:
                 groups["HOLD-MISS"].append(
-                    f"{room} ({track}) — Hold if {metric} {op} {threshold}; BP {sbp}/{dbp}"
+                    f"{room} ({track}) - Hold if {metric} {op} {threshold}; BP {sbp}/{dbp}"
                 )
             elif hr is not None:
                 groups["HOLD-MISS"].append(
-                    f"{room} ({track}) — Hold if {metric} {op} {threshold}; HR {hr}"
+                    f"{room} ({track}) - Hold if {metric} {op} {threshold}; HR {hr}"
                 )
             else:
                 groups["HOLD-MISS"].append(
-                    f"{room} ({track}) — Hold if {metric} {op} {threshold}"
+                    f"{room} ({track}) - Hold if {metric} {op} {threshold}"
                 )
         elif r.decision == "HELD-APPROPRIATE":
             code = r.admin.get("chart_code") if r.admin else None
             suffix = f"code {code}" if code is not None else "code"
-            groups["HELD-APPROPRIATE"].append(f"{room} ({track}) — {suffix}")
+            groups["HELD-APPROPRIATE"].append(f"{room} ({track}) - {suffix}")
         elif r.decision == "COMPLIANT":
-            groups["COMPLIANT"].append(f"{room} ({track}) — ✓")
+            groups["COMPLIANT"].append(f"{room} ({track}) - ✓")
         elif r.decision == "DC'D":
-            groups["DC'D"].append(f"{room} ({track}) — X in due cell")
+            groups["DC'D"].append(f"{room} ({track}) - X in due cell")
     return groups
 
 

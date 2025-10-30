@@ -24,6 +24,7 @@ from hushdesk.ui.theme import load_theme_name, save_theme_name, select_palette
 from hushdesk.ui.util import hall_from_rooms
 from hushdesk.pdf.backends import MuPdfBackend, PdfUnavailable, PlumberBackend, get_backend
 from hushdesk.core.engine import run_sim
+from hushdesk.pdf.mar_parser import parse_mar_pdf
 from hushdesk.core import building_master as BM
 from hushdesk.version import APP_VERSION
 
@@ -56,13 +57,20 @@ def run_simulation(fixture_path: str, room_pattern: str | None = None) -> dict:
     return payload
 
 
-def run_pdf_backend(pdf_path: str, date_str: str, room_filter: str | None) -> dict:  # pragma: no cover - placeholder
-    from hushdesk.core.engine import run_pdf  # type: ignore[attr-defined]
-
-    runner = getattr(run_pdf, "run_on_pdf", None)
-    if runner is None:
-        raise PdfUnavailable("engine_missing")
-    return runner(pdf_path, date_str=date_str, room_filter=room_filter)
+def run_pdf_backend(pdf_path: str, date_str: str = "", room_filter: str | None = None) -> dict:
+    try:
+        result = parse_mar_pdf(pdf_path)
+        return {
+            "ok": True,
+            "doses": [dose.__dict__ for dose in result.doses],
+            "notes": result.notes,
+            "meta": result.meta,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"Failed to parse MAR: {exc}",
+        }
 
 
 class HushDeskApp:
@@ -704,6 +712,111 @@ class HushDeskApp:
         toggle_btn = ttk.Button(header, text="Show", command=toggle)
         toggle_btn.pack(side="right", padx=12)
 
+    def _render_pdf_preview(self, payload: dict) -> None:
+        doses = payload.get("doses", [])
+        notes = payload.get("notes", [])
+        if not doses:
+            ttk.Label(
+                self.results,
+                text="Couldn't find the MAR schedule grid on this PDF. Check the month header and Chart Codes legend are present.",
+                font=("Segoe UI", 11, "bold"),
+                foreground=self.palette["danger"],
+                wraplength=720,
+                justify="left",
+            ).pack(anchor="w", padx=12, pady=(12, 4))
+            for note in notes:
+                ttk.Label(self.results, text=f"Note: {note}", style="Muted.TLabel", wraplength=720, justify="left").pack(
+                    anchor="w", padx=16, pady=2
+                )
+            return
+
+        card = ttk.Frame(self.results, style="Card.TFrame")
+        card.pack(fill="both", expand=True, pady=(8, 0))
+        header = tk.Frame(card, bg=self.palette.get("surface", self.palette["bg"]))
+        header.pack(fill="x")
+        ttk.Label(header, text="MAR Dose Preview", font=("Segoe UI", 11, "bold")).pack(side="left", padx=12, pady=8)
+
+        body = tk.Frame(card, bg=self.palette.get("surface", self.palette["bg"]))
+        body.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+        for dose in doses:
+            container = tk.Frame(body, bg=self.palette.get("surface", self.palette["bg"]))
+            container.pack(fill="x", pady=4)
+            ttk.Label(
+                container,
+                text=dose.get("med", ""),
+                font=("Segoe UI", 10, "bold"),
+            ).pack(anchor="w")
+
+            timing_bits: List[str] = []
+            raw_time = dose.get("raw_time") or "-"
+            normalized = dose.get("normalized_time")
+            time_range = dose.get("time_range")
+            slot = dose.get("slot")
+            if normalized:
+                timing_bits.append(f"Normalized {normalized}")
+            if time_range:
+                timing_bits.append(f"Range {time_range}")
+            if slot:
+                timing_bits.append(f"Slot {slot}")
+            timing = " • ".join(timing_bits) if timing_bits else "No normalized time"
+            ttk.Label(
+                container,
+                text=f"Raw {raw_time} — {timing}",
+                style="Muted.TLabel",
+                wraplength=720,
+                justify="left",
+            ).pack(anchor="w", padx=8)
+            ttk.Label(
+                container,
+                text=f"Cell: {dose.get('cell', '')}",
+                wraplength=720,
+                justify="left",
+            ).pack(anchor="w", padx=8, pady=(0, 2))
+
+        for note in notes:
+            ttk.Label(body, text=f"Note: {note}", style="Muted.TLabel", wraplength=720, justify="left").pack(
+                anchor="w", pady=2
+            )
+
+    def _render_pdf_error(self, message: str) -> None:
+        self._clear_results()
+        ttk.Label(
+            self.results,
+            text=message,
+            font=("Segoe UI", 11, "bold"),
+            foreground=self.palette["danger"],
+            wraplength=720,
+            justify="left",
+        ).pack(anchor="w", padx=12, pady=(12, 4))
+
+    def _handle_pdf_preview_result(self, payload: dict, elapsed: float) -> None:
+        error_message = ""
+        if not payload.get("ok", False):
+            error_message = payload.get("error", "Failed to parse MAR.")
+            if "no schedule grid found" in error_message.lower():
+                error_message = (
+                    "Couldn't find the MAR schedule grid on this PDF. Check the month header and Chart Codes legend are present."
+                )
+            self._render_pdf_error(error_message)
+            self._set_summary({"reviewed": 0, "hold_miss": 0, "held_ok": 0, "compliant": 0, "dcd": 0})
+            self.footer_time.configure(text=f"Time: {elapsed:.1f}s")
+            return
+
+        doses = payload.get("doses", [])
+        self._set_summary(
+            {
+                "reviewed": len(doses),
+                "hold_miss": 0,
+                "held_ok": 0,
+                "compliant": len(doses),
+                "dcd": 0,
+            }
+        )
+        self._clear_results()
+        self._render_pdf_preview(payload)
+        self.footer_time.configure(text=f"Time: {elapsed:.1f}s")
+
     # ------------------------------------------------------------------
     # Backend interaction helpers
     def _selected_path(self) -> Path | None:
@@ -734,7 +847,7 @@ class HushDeskApp:
 
     def _update_cached_payload_hall(self) -> None:
         payload = self.state.get("last_payload")
-        if not payload:
+        if not payload or "header" not in payload:
             return
         hall_value = self._current_hall_value()
         header = payload.setdefault("header", {})
@@ -744,6 +857,8 @@ class HushDeskApp:
             header.pop("hall", None)
 
     def _apply_hall_override_to_payload(self, payload: dict) -> None:
+        if "header" not in payload:
+            return
         header = payload.setdefault("header", {})
         hall_value = (self.state.get("hall_override") or "").strip()
         if not hall_value:
@@ -754,7 +869,10 @@ class HushDeskApp:
         else:
             header.pop("hall", None)
         self._update_cached_payload_hall()
+
     def _update_header_from_payload(self, payload: dict) -> None:
+        if "header" not in payload:
+            return
         rooms = payload.get("rooms", [])
         hall, hall_num = hall_from_rooms(rooms)
         header_hall = (payload.get("header") or {}).get("hall")
@@ -806,6 +924,9 @@ class HushDeskApp:
 
     def _on_quick_check_done(self, payload: dict, elapsed: float) -> None:
         self.state["last_payload"] = payload
+        if "ok" in payload:
+            self._handle_pdf_preview_result(payload, elapsed)
+            return
         self._update_header_from_payload(payload)
         self._set_summary(payload["summary"])
         self._clear_results()
@@ -852,6 +973,10 @@ class HushDeskApp:
 
     def _on_run_audit_done(self, payload: dict, elapsed: float) -> None:
         self.state["last_payload"] = payload
+        if "ok" in payload:
+            self._handle_pdf_preview_result(payload, elapsed)
+            self._after_finish()
+            return
         self._update_header_from_payload(payload)
         self._set_summary(payload["summary"])
 
@@ -873,6 +998,8 @@ class HushDeskApp:
         payload = self.state.get("last_payload")
         if not payload:
             raise RuntimeError("No checklist available yet. Run Quick Check or Run Audit first.")
+        if "ok" in payload:
+            raise RuntimeError("PDF preview does not produce an exportable checklist yet.")
         return payload
 
     def _copy_txt(self) -> None:
@@ -914,3 +1041,4 @@ def main() -> None:  # pragma: no cover - UI entry point
 
 if __name__ == "__main__":  # pragma: no cover
     main()
+

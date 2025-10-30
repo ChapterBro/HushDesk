@@ -284,7 +284,7 @@ def has_vector_x(
                     or box_i[3] < box_j[1]
                     or box_j[3] < box_i[1]
                 ):
-                    # Overlapping bounding boxes inside rect — treat as X
+                    # Overlapping bounding boxes inside rect - treat as X
                     return True
     return False
 

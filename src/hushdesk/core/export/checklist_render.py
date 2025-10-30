@@ -20,7 +20,7 @@ def write_txt(path: str, header: Dict, summary: Dict, sections: Dict[str, List[s
     header: {"date_str":"MM-DD-YYYY","hall":"Holaday","source":"file.pdf"?}
     summary: {"reviewed":N,"hold_miss":N,"held_ok":N,"compliant":N,"dcd":N}
     sections: {"HOLD-MISS":[...],"HELD-APPROPRIATE":[...],"COMPLIANT":[...],"DC'D":[...]}
-    Each line already formatted as "<room> (<AM|PM>) — ...".
+    Each line already formatted as "<room> (<AM|PM>) - ...".
     """
     lines: List[str] = []
 

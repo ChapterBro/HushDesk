@@ -1,10 +1,11 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 import os
 import re
 import threading
 import time
 import sys
 import importlib
+import importlib.resources as pkg_resources
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import tkinter as tk
@@ -13,15 +14,15 @@ from tkinter import filedialog, messagebox, ttk
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD  # type: ignore
 
-    _DND_OK = True
+    DND_OK = True
 except Exception:  # pragma: no cover - optional dependency
     DND_FILES = None  # type: ignore[assignment]
     TkinterDnD = None  # type: ignore[assignment]
-    _DND_OK = False
+    DND_OK = False
 
 from hushdesk.ui.theme import load_theme_name, save_theme_name, select_palette
 from hushdesk.ui.util import hall_from_rooms
-from hushdesk.pdf.backends import PdfUnavailable, get_backend
+from hushdesk.pdf.backends import MuPdfBackend, PdfUnavailable, PlumberBackend, get_backend
 from hushdesk.core.engine import run_sim
 from hushdesk.core import building_master as BM
 from hushdesk.version import APP_VERSION
@@ -79,11 +80,10 @@ class HushDeskApp:
             "detected_hall": None,
             "detected_hall_num": None,
         }
-        self._pdf_helper_dialog: Optional[tk.Toplevel] = None
         self._updating_hall_entry = False
         self._suppress_hall_events = False
         self._hall_choices = BM.halls()
-        self._bridgeman_fixture_cache: Optional[Path] = None
+        self._fixture_cache: Dict[str, Path] = {}
         self._preflight_status = self._compute_preflight_status()
 
         self._apply_theme()
@@ -158,8 +158,8 @@ class HushDeskApp:
         file_row.pack(fill="x", padx=12, pady=(0, 12))
         self.file_entry = ttk.Entry(file_row, textvariable=self.file_var, width=70)
         self.file_entry.pack(side="left", fill="x", expand=True)
-        ttk.Button(file_row, text="Browse…", command=self._on_browse_clicked).pack(side="right", padx=(8, 0))
-        if _DND_OK and DND_FILES is not None:
+        ttk.Button(file_row, text="Browse...", command=self._on_browse_clicked).pack(side="right", padx=(8, 0))
+        if DND_OK and DND_FILES is not None:
             try:
                 self.file_entry.drop_target_register(DND_FILES)
                 self.file_entry.dnd_bind("<<Drop>>", self._on_drop_files)
@@ -179,11 +179,11 @@ class HushDeskApp:
         # Run controls --------------------------------------------------
         run_row = tk.Frame(self.root, bg=p["bg"])
         run_row.pack(fill="x", padx=12, pady=(6, 0))
-        primary = ttk.Button(run_row, text="Run Audit", command=self._run_audit)
+        primary = ttk.Button(run_row, text="Run Audit", command=self._on_run_audit_clicked)
         primary.pack(side="left")
         self.quick_menu = ttk.Menubutton(run_row, text="Quick Actions")
         qm = tk.Menu(self.quick_menu, tearoff=0)
-        qm.add_command(label="Quick Check", command=self._quick_check)
+        qm.add_command(label="Quick Check", command=self._on_quick_check_clicked)
         load_fixture_menu = tk.Menu(qm, tearoff=0)
         load_fixture_menu.add_command(label="Bridgeman (sample)", command=self._load_bridgeman_sample)
         qm.add_cascade(label="Load Fixture", menu=load_fixture_menu)
@@ -251,7 +251,7 @@ class HushDeskApp:
         status_row.pack(fill="x", pady=(2, 0))
         self.preflight_var = tk.StringVar(value=self._format_preflight_status())
         ttk.Label(status_row, textvariable=self.preflight_var, style="Muted.TLabel").pack(side="left")
-        self.footer_time = ttk.Label(status_row, text="Time: —", style="Muted.TLabel")
+        self.footer_time = ttk.Label(status_row, text="Time: -", style="Muted.TLabel")
         self.footer_time.pack(side="right")
 
         self._set_summary(self.state["last_summary"])
@@ -295,7 +295,7 @@ class HushDeskApp:
             tk.Label(frame, text=body, justify="left", wraplength=520, bg=p["bg"], fg=p["text"]).pack(anchor="w", pady=(0, 10))
 
         add_section("What HushDesk does", "Checks BP med pass compliance by matching hold rules to what was documented for each dose on the chosen date.")
-        add_section("What you’ll see", "• Hold-Miss — should’ve been held, but was given.\n• Held-OK — valid hold code (4, 6, 11, 12, 15).\n• Compliant — given and within the rule.\n• DC’D — clearly X’d out for the day.\n• Reviewed — how many doses we checked.")
+        add_section("What you'll see", "• Hold-Miss - should've been held, but was given.\n• Held-OK - valid hold code (4, 6, 11, 12, 15).\n• Compliant - given and within the rule.\n• DC'D - clearly X'd out for the day.\n• Reviewed - how many doses we checked.")
         add_section("Privacy", "• Runs completely offline. HushDesk never uses the internet.\n• Never stores PHI/PII (outputs are hall + room only).\n• Files you save remain on your machine with private permissions.\n• Encryption at rest is planned.")
         ttk.Button(frame, text="Got it", command=top.destroy).pack(anchor="e", pady=(4, 0))
 
@@ -309,66 +309,17 @@ class HushDeskApp:
         )
 
     def _show_pdf_missing_dialog(self) -> None:
-        existing = getattr(self, "_pdf_helper_dialog", None)
-        try:
-            if existing is not None and existing.winfo_exists():
-                existing.lift()
-                existing.focus_set()
-                return
-        except Exception:
-            self._pdf_helper_dialog = None
-
-        top = tk.Toplevel(self.root)
-        self._pdf_helper_dialog = top
-        top.title("Can't read this MAR yet")
-        top.transient(self.root)
-        top.grab_set()
-        top.resizable(False, False)
-        palette = self.palette
-        top.configure(bg=palette["bg"])
-        top.protocol("WM_DELETE_WINDOW", self._close_pdf_helper_dialog)
-
-        frame = tk.Frame(top, bg=palette["bg"])
-        frame.pack(padx=22, pady=20)
-
         body = (
-            "This build doesn’t have the PDF reader bundled.\n"
+            "This build doesn't have the PDF reader bundled.\n\n"
             "Try now: Load a sample Fixture (no PHI) from Quick Actions to see HushDesk work.\n"
             "Next build: include the PDF reader so real MARs open normally."
         )
-        tk.Label(
-            frame,
-            text=body,
-            justify="left",
-            wraplength=520,
-            bg=palette["bg"],
-            fg=palette["text"],
-        ).pack(anchor="w", pady=(0, 18))
-
-        buttons = tk.Frame(frame, bg=palette["bg"])
-        buttons.pack(fill="x")
-        ttk.Button(buttons, text="Open Quick Actions", command=self._handle_pdf_missing_quick_actions).pack(
-            side="left"
-        )
-        ttk.Button(buttons, text="OK", command=self._close_pdf_helper_dialog).pack(side="right")
-
-    def _close_pdf_helper_dialog(self) -> None:
-        dialog = getattr(self, "_pdf_helper_dialog", None)
-        if dialog is not None:
+        prompt = "Open Quick Actions now?\n\n" + body
+        if messagebox.askyesno("Can't read this MAR yet", prompt):
             try:
-                dialog.grab_release()
+                self._open_quick_actions_menu_highlight("Load Fixture")
             except Exception:
-                pass
-            if dialog.winfo_exists():
-                dialog.destroy()
-        self._pdf_helper_dialog = None
-
-    def _handle_pdf_missing_quick_actions(self) -> None:
-        self._close_pdf_helper_dialog()
-        def _launch():
-            if not self._load_bridgeman_sample():
-                self._open_quick_actions_menu()
-        self.root.after(50, _launch)
+                self._load_fixture_and_run("bridgeman_sample.json")
 
     def _open_quick_actions_menu(self) -> None:
         menu = getattr(self, "_quick_actions_menu", None)
@@ -387,40 +338,76 @@ class HushDeskApp:
             except Exception:
                 pass
 
-    def _resolve_bridgeman_fixture(self) -> Optional[Path]:
-        if self._bridgeman_fixture_cache and self._bridgeman_fixture_cache.exists():
-            return self._bridgeman_fixture_cache
-        candidates: List[Path] = []
+    def _open_quick_actions_menu_highlight(self, label: str) -> None:
+        menu = getattr(self, "_quick_actions_menu", None)
+        btn = getattr(self, "quick_menu", None)
+        if not menu or not btn:
+            raise RuntimeError("Quick Actions menu unavailable.")
+        self._open_quick_actions_menu()
+        try:
+            index = menu.index(label)
+        except tk.TclError:
+            index = None
+        if index is not None:
+            try:
+                menu.activate(index)
+            except tk.TclError:
+                pass
+
+    def _load_fixture_and_run(self, filename: str) -> None:
+        path = self._resolve_fixture(filename)
+        if not path:
+            messagebox.showerror("HushDesk", f"Fixture '{filename}' is not bundled in this build.")
+            return
+        self._on_file_chosen(str(path))
+
+    def _resolve_fixture(self, filename: str) -> Optional[Path]:
+        cached = self._fixture_cache.get(filename)
+        if cached and cached.exists():
+            return cached
         base_meipass = getattr(sys, "_MEIPASS", None)
         if base_meipass:
-            meipass_path = Path(base_meipass)
-            candidates.extend(
-                [
-                    meipass_path / "fixtures" / "bridgeman_sample.json",
-                    meipass_path / "hushdesk" / "fixtures" / "bridgeman_sample.json",
-                ]
-            )
+            candidate = Path(base_meipass) / "fixtures" / filename
+            if candidate.exists():
+                self._fixture_cache[filename] = candidate
+                return candidate
+        try:
+            with pkg_resources.as_file(pkg_resources.files("hushdesk").joinpath("fixtures", filename)) as res_path:
+                if res_path.exists():
+                    self._fixture_cache[filename] = res_path
+                    return res_path
+        except Exception:
+            pass
         project_root = Path(__file__).resolve().parents[3]
-        candidates.append(project_root / "fixtures" / "bridgeman_sample.json")
-        candidates.append(Path.cwd() / "fixtures" / "bridgeman_sample.json")
-        for cand in candidates:
-            if cand.exists():
-                self._bridgeman_fixture_cache = cand
-                return cand
-        self._bridgeman_fixture_cache = None
+        repo_candidate = project_root / "fixtures" / filename
+        if repo_candidate.exists():
+            self._fixture_cache[filename] = repo_candidate
+            return repo_candidate
+        package_candidate = Path(__file__).resolve().parents[1] / "fixtures" / filename
+        if package_candidate.exists():
+            self._fixture_cache[filename] = package_candidate
+            return package_candidate
         return None
 
     def _load_bridgeman_sample(self) -> bool:
-        path = self._resolve_bridgeman_fixture()
+        path = self._resolve_fixture("bridgeman_sample.json")
         if not path:
             messagebox.showerror("HushDesk", "Sample fixture not bundled in this build.")
             return False
         self._on_file_chosen(str(path))
-        self.root.after(100, self._quick_check)
         return True
 
     # ------------------------------------------------------------------
     # File selection
+    def _normalize_path(self, raw_path: str) -> str:
+        candidate = (raw_path or "").strip()
+        if candidate.startswith("{") and candidate.endswith("}"):
+            candidate = candidate[1:-1]
+        return candidate.strip().strip('"')
+
+    def _toast(self, message: str) -> None:
+        messagebox.showwarning("HushDesk", message)
+
     def _on_drop_files(self, event) -> None:  # type: ignore[override]
         data = getattr(event, "data", "")
         try:
@@ -429,45 +416,81 @@ class HushDeskApp:
             paths = []
         if not paths:
             return
-        dropped = paths[0].strip()
-        if dropped.startswith("{") and dropped.endswith("}"):
-            dropped = dropped[1:-1]
-        dropped = dropped.strip().strip('"')
-        if not dropped:
+        candidate = self._normalize_path(paths[0])
+        if not candidate:
             return
-        self._on_file_chosen(dropped)
+        if os.path.isdir(candidate):
+            self._toast("Drop a file, not a folder.")
+            return
+        self._on_file_chosen(candidate)
 
     def _on_browse_clicked(self) -> None:
-        path = filedialog.askopenfilename(
-            title="Select MAR PDF or fixture",
-            filetypes=[("MAR PDF/Fixture", "*.pdf *.json"), ("PDF files", "*.pdf"), ("Fixture JSON", "*.json")],
-        )
+        path = filedialog.askopenfilename(filetypes=[("MAR PDF/Fixture", "*.pdf *.json")])
         if path:
             self._on_file_chosen(path)
 
     def _on_file_chosen(self, raw_path: str) -> None:
-        candidate = raw_path.strip()
-        if not candidate:
+        normalized = self._normalize_path(raw_path)
+        if not normalized:
             return
-        path_text = candidate
-        if path_text.startswith("{") and path_text.endswith("}"):
-            path_text = path_text[1:-1]
-        path_text = path_text.strip().strip('"')
-        path = Path(path_text)
+        self.file_var.set(normalized)
+        if self._quick_check_for_path(normalized):
+            self._start_quick_check()
+
+    def _quick_check_for_path(self, path_text: str) -> bool:
+        normalized = self._normalize_path(path_text)
+        if not normalized:
+            return False
+        path = Path(normalized)
         if path.is_dir():
-            messagebox.showwarning("HushDesk", "Drop a file, not a folder.")
-            return
+            self._toast("Drop a file, not a folder.")
+            return False
         if not path.exists():
-            messagebox.showwarning("HushDesk", "That file could not be found.")
-            return
-        if path.suffix.lower() not in {".pdf", ".json"}:
-            messagebox.showwarning("HushDesk", "Unsupported file type. Use a MAR PDF or fixture JSON.")
-            return
+            self._toast("That file could not be found.")
+            return False
+        suffix = path.suffix.lower()
+        if suffix not in {".pdf", ".json"}:
+            self._toast("Unsupported file type. Use a MAR PDF or Fixture JSON.")
+            return False
+        if suffix == ".pdf":
+            try:
+                backend = get_backend()
+            except PdfUnavailable:
+                self._show_pdf_missing_dialog()
+                return False
+            if isinstance(backend, MuPdfBackend):
+                self.state["pdf_backend"] = "mupdf"
+                self._preflight_status["mupdf"] = True
+            elif isinstance(backend, PlumberBackend):
+                self.state["pdf_backend"] = "pdfplumber"
+                self._preflight_status["pdfplumber"] = True
+            else:
+                self.state["pdf_backend"] = backend.__class__.__name__.lower()
+        else:
+            self.state["pdf_backend"] = "fixture"
         self._set_file(path)
+        if hasattr(self, "preflight_var"):
+            self.preflight_var.set(self._format_preflight_status())
+        return True
+
+    def _on_quick_check_clicked(self) -> None:
+        path = (self.file_var.get() or "").strip()
+        if not path:
+            self._toast("Pick a MAR PDF or Fixture first.")
+            return
+        if self._quick_check_for_path(path):
+            self._start_quick_check()
+
+    def _on_run_audit_clicked(self) -> None:
+        path = (self.file_var.get() or "").strip()
+        if not path:
+            self._toast("Pick a MAR PDF or Fixture first.")
+            return
+        if self._quick_check_for_path(path):
+            self._start_audit()
 
     def _set_file(self, path: Path) -> None:
         self.state["file"] = path
-        self.state["pdf_backend"] = None
         self.file_var.set(str(path))
         rooms: List[str] = []
         date_display: Optional[str] = None
@@ -555,7 +578,7 @@ class HushDeskApp:
         return {
             "mupdf": self._probe_module("fitz"),
             "pdfplumber": self._probe_module("pdfplumber"),
-            "dnd": bool(_DND_OK),
+            "dnd": bool(DND_OK),
         }
 
     def _format_preflight_status(self) -> str:
@@ -568,7 +591,7 @@ class HushDeskApp:
         )
 
     def _footer_info_text(self) -> str:
-        return f"v{APP_VERSION} • America/Chicago • Safety: On"
+        return f"v{APP_VERSION} • America/Chicago • Safety: On."
 
     def _ensure_pdf_backend(self, path: Path):
         backend = get_backend()
@@ -585,12 +608,15 @@ class HushDeskApp:
         return backend
 
     def _run_pdf_pipeline(self, path: Path, backend: Any, room_pattern: str | None) -> dict:
-        backend_name = getattr(backend, "name", "pdf")
-        self.state["pdf_backend"] = backend_name
-        if backend_name == "mupdf":
+        if isinstance(backend, MuPdfBackend):
+            backend_name = "mupdf"
             self._preflight_status["mupdf"] = True
-        elif backend_name.startswith("pdf"):
+        elif isinstance(backend, PlumberBackend):
+            backend_name = "pdfplumber"
             self._preflight_status["pdfplumber"] = True
+        else:
+            backend_name = backend.__class__.__name__.lower()
+        self.state["pdf_backend"] = backend_name
         if hasattr(self, "preflight_var"):
             self.preflight_var.set(self._format_preflight_status())
         return run_pdf_backend(str(path), date_str="", room_filter=room_pattern)
@@ -750,7 +776,7 @@ class HushDeskApp:
         self.progress_lbl.configure(text="")
         self.progress.configure(value=0)
 
-    def _quick_check(self) -> None:
+    def _start_quick_check(self) -> None:
         try:
             self._compute_payload  # ensure file selected check earlier
         except RuntimeError:
@@ -759,7 +785,7 @@ class HushDeskApp:
             messagebox.showwarning("HushDesk", "Select a MAR (PDF or fixture) first.")
             return
         self._clear_results()
-        self._after_start("Checking…", mode="quick")
+        self._after_start("Checking...", mode="quick")
 
         def worker():
             start = time.time()
@@ -786,12 +812,12 @@ class HushDeskApp:
         self._render_violations(payload.get("violations", []))
         self.footer_time.configure(text=f"Time: {elapsed:.1f}s")
 
-    def _run_audit(self) -> None:
+    def _start_audit(self) -> None:
         if not self._selected_path():
             messagebox.showwarning("HushDesk", "Select a MAR (PDF or fixture) first.")
             return
         self._clear_results()
-        self._after_start("Preparing…", mode="audit")
+        self._after_start("Preparing...", mode="audit")
 
         def worker():
             start = time.time()
@@ -878,14 +904,13 @@ class HushDeskApp:
 
 
 def main() -> None:  # pragma: no cover - UI entry point
-    root_cls = (TkinterDnD.Tk if (_DND_OK and TkinterDnD is not None) else tk.Tk)  # type: ignore
-    root = root_cls()
+    if DND_OK and TkinterDnD is not None:
+        root = TkinterDnD.Tk()  # type: ignore[call-arg]
+    else:
+        root = tk.Tk()
     app = HushDeskApp(root)
     root.mainloop()
 
 
 if __name__ == "__main__":  # pragma: no cover
     main()
-
-
-

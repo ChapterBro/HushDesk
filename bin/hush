@@ -90,7 +90,7 @@ usage() {
   cat <<USAGE
 Usage:
   bin/hush trial        # GUI picker on macOS; falls back to prompts if headless
-  bin/hush texttrial --mar "/abs/path/MAR.pdf" --date MM-DD-YYYY --hall {Mercer|Holaday|Bridgman|Morton}
+  bin/hush texttrial --mar "/abs/path/MAR.pdf" --date MM-DD-YYYY --hall {Mercer|Holaday|Bridgeman|Morton}
 
 Env:
   HD_TRY_INSTALL=0     # skip pip installs entirely (default: 1)
@@ -116,10 +116,10 @@ case "${1:-}" in
     if ! DATE="$(infer_date_mmddyyyy "$MAR")"; then
       read -r -p "Enter MAR date (MM-DD-YYYY): " DATE
     fi
-    echo "Choose hall: 1) Mercer  2) Holaday  3) Bridgman  4) Morton"
+    echo "Choose hall: 1) Mercer  2) Holaday  3) Bridgeman  4) Morton"
     read -r -p "Enter 1-4: " idx
     case "$idx" in
-      1) HALL="Mercer" ;; 2) HALL="Holaday" ;; 3) HALL="Bridgman" ;; 4) HALL="Morton" ;; *) echo "Bad choice" >&2; exit 2 ;;
+      1) HALL="Mercer" ;; 2) HALL="Holaday" ;; 3) HALL="Bridgeman" ;; 4) HALL="Morton" ;; *) echo "Bad choice" >&2; exit 2 ;;
     esac
     run_audit "$MAR" "$DATE" "$HALL"
     ;;

@@ -189,9 +189,25 @@ def _collect_line_segments(doc, page_index: int) -> List[Tuple[float, float, flo
     segments: List[Tuple[float, float, float, float]] = []
     for drawing in _page_drawings(doc, page_index):
         for item in drawing.get("items", []):
-            if not item or item[0] != "l":  # only straight lines
+            if not item:
                 continue
-            _, x0, y0, x1, y1 = item
+            tag = item[0]
+            if tag != "l":
+                continue
+            if len(item) == 5:
+                _, x0, y0, x1, y1 = item
+            elif len(item) == 3:
+                _, p0, p1 = item
+                def _coords(pt):
+                    if hasattr(pt, "x") and hasattr(pt, "y"):
+                        return float(pt.x), float(pt.y)
+                    if isinstance(pt, (tuple, list)) and len(pt) >= 2:
+                        return float(pt[0]), float(pt[1])
+                    raise TypeError("Unsupported point type in drawing segment")
+                x0, y0 = _coords(p0)
+                x1, y1 = _coords(p1)
+            else:
+                continue
             segments.append((x0, y0, x1, y1))
     return segments
 

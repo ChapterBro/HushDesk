@@ -6,11 +6,15 @@ class PdfUnavailable(Exception):
 
 
 class PdfBackend:
+    name = "unknown"
+
     def open(self, path: str) -> Any:
         raise NotImplementedError
 
 
 class MuPdfBackend(PdfBackend):
+    name = "mupdf"
+
     def __init__(self):
         import fitz  # PyMuPDF
 
@@ -21,6 +25,8 @@ class MuPdfBackend(PdfBackend):
 
 
 class PlumberBackend(PdfBackend):
+    name = "pdfplumber"
+
     def __init__(self):
         import pdfplumber
 

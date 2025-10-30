@@ -32,9 +32,15 @@ _MONTH_KEYWORDS = (
 def find_mar_blocks(pages: List[List[str]]) -> List[MarBlock]:
     blocks: List[MarBlock] = []
     for pidx, lines in enumerate(pages):
-        has_schedule = any(
-            "Schedule for" in ln and any(month in ln for month in _MONTH_KEYWORDS) for ln in lines
-        )
+        has_schedule = False
+        for idx, ln in enumerate(lines):
+            if "Schedule for" not in ln:
+                continue
+            # Some MARs render the month on the next line; check a small window.
+            window = lines[idx : idx + 3]
+            if any(any(month in candidate for month in _MONTH_KEYWORDS) for candidate in window):
+                has_schedule = True
+                break
         has_codes = any("Chart Codes" in ln for ln in lines)
         if has_schedule and has_codes:
             blocks.append(MarBlock(page_index=pidx, y_top=0.0, y_bottom=1.0, lines=lines))

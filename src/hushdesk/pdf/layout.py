@@ -1,27 +1,51 @@
 from __future__ import annotations
 
-import statistics
 from collections import defaultdict
 from typing import Iterable, List, Sequence
 
 from .engine_base import Cell, Row, Word
+from .grid_geometry import extract_grid_rows
 
 __all__ = ["Row", "Cell", "extract_rows"]
 
 _HEADER_SIGNATURE = {"room", "medication", "am", "pm"}
+_DAY_NAMES = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"}
 
 
-def extract_rows(words: Iterable[Word]) -> List[Row]:
+def extract_rows(words: Iterable[Word], *, source_path: str | None = None) -> List[Row]:
     word_list = [w for w in words if w.text.strip()]
     if not word_list:
         return []
 
-    heights = [w.height for w in word_list if w.height > 0]
-    median_height = statistics.median(heights) if heights else 10.0
+    rows: List[Row] = []
+    if source_path:
+        page_words: dict[int, List[Word]] = defaultdict(list)
+        for word in word_list:
+            page_words[word.page].append(word)
+        grid_rows = extract_grid_rows(source_path, page_words)
+        covered_pages = set(grid_rows.keys())
+        for page_index in sorted(covered_pages):
+            rows.extend(grid_rows[page_index])
+        remaining_words = [w for w in word_list if w.page not in covered_pages]
+        if remaining_words:
+            rows.extend(_legacy_extract_rows(remaining_words))
+    else:
+        rows = _legacy_extract_rows(word_list)
+
+    rows.sort(key=lambda r: (r.page, r.y0, r.y1))
+    return _filter_rows(rows)
+
+
+def _legacy_extract_rows(words: Sequence[Word]) -> List[Row]:
+    if not words:
+        return []
+
+    heights = [w.height for w in words if w.height > 0]
+    median_height = sorted(heights)[len(heights) // 2] if heights else 10.0
     y_tol = max(median_height * 0.6, 1.0)
 
     buckets: dict[tuple[int, int], List[Word]] = defaultdict(list)
-    for w in word_list:
+    for w in words:
         bucket = int(round(w.y0 / y_tol))
         buckets[(w.page, bucket)].append(w)
 
@@ -30,18 +54,25 @@ def extract_rows(words: Iterable[Word]) -> List[Row]:
         page, _ = page_bucket
         row_words = sorted(buckets[page_bucket], key=lambda w: (w.x0, w.y0))
         cells = _words_to_cells(row_words, median_height)
-        if len(cells) < 1:
+        if not cells:
             continue
         y0 = min(w.y0 for w in row_words)
         y1 = max(w.y1 for w in row_words)
-        row = Row(cells=cells, y0=y0, y1=y1, page=page)
-        rows.append(row)
+        rows.append(Row(cells=cells, y0=y0, y1=y1, page=page))
+    return rows
 
+
+def _filter_rows(rows: Sequence[Row]) -> List[Row]:
     filtered: List[Row] = []
     for row in rows:
         if len(row.cells) < 4:
             continue
         if _is_header(row):
+            continue
+        if _looks_like_day_header(row):
+            continue
+        leading = [cell.text.strip() for cell in row.cells[:2]]
+        if not any(leading):
             continue
         filtered.append(row)
     return filtered
@@ -79,7 +110,25 @@ def _is_header(row: Row) -> bool:
     normalized = [cell.text.strip().lower() for cell in row.cells if cell.text.strip()]
     if not normalized:
         return False
-    return set(normalized) >= _HEADER_SIGNATURE
+    if set(normalized) >= _HEADER_SIGNATURE:
+        return True
+    return any(token in {"room", "resident"} for token in normalized[:2])
+
+
+def _looks_like_day_header(row: Row) -> bool:
+    tokens = [cell.text.strip().upper() for cell in row.cells if cell.text.strip()]
+    if not tokens:
+        return False
+    day_tokens = sum(1 for token in tokens if token in _DAY_NAMES or token.rstrip("1234567890") in _DAY_NAMES)
+    number_tokens = sum(1 for token in tokens if token.isdigit() and 1 <= int(token) <= 31)
+    if day_tokens >= max(3, len(tokens) // 2):
+        return True
+    if number_tokens >= max(5, len(tokens) // 2):
+        return True
+    lead = [cell.text.strip().upper() for cell in row.cells[:2] if cell.text.strip()]
+    if lead and all(entry.isdigit() for entry in lead):
+        return True
+    return False
 
 
 def _normalize_cell_text(raw: str) -> str:

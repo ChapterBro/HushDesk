@@ -76,6 +76,16 @@ def header_footer_pdf(tmp_path_factory: pytest.TempPathFactory) -> Path:
     )
     return out
 
+@pytest.fixture(scope="session")
+def monthly_mar_pdf(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    if fitz is None:
+        pytest.skip("PyMuPDF not installed; synthetic PDF generation requires fitz")
+    out = tmp_path_factory.mktemp("pdfs") / "monthly_mar.pdf"
+    if out.exists():
+        out.unlink()
+    _write_monthly_pdf(out)
+    return out
+
 def _with_jitter(rows: Sequence[Sequence[str]], jitter: bool) -> List[List[str]]:
     if not jitter:
         return [list(r) for r in rows]
@@ -109,6 +119,65 @@ def _write_synthetic_pdf(path: Path, pages: Iterable[Iterable[Sequence[str]]],
             _draw_row(page, row, xs, y + _row_jitter(r_idx, jitter, line_h))
             y += line_h
         page.insert_text(fitz.Point(180, 742), f"{footer_text} {page_index}", fontsize=10, fontname="helv")
+    doc.save(path)
+    doc.close()
+
+def _write_monthly_pdf(path: Path) -> None:
+    assert fitz is not None, "PyMuPDF required to synthesize PDFs in tests"
+    doc = fitz.open()
+    page = doc.new_page(width=612, height=792)
+
+    # Header with hall reference
+    page.insert_text(fitz.Point(200, 72), "Bridgeman Hall Monthly MAR", fontsize=14, fontname="helv")
+    page.insert_text(fitz.Point(200, 90), "October 2025", fontsize=12, fontname="helv")
+
+    block_x = 60.0
+    grid_top = 120.0
+    row_height = 12.0
+    col_width = 72.0
+    cols = 3
+    rows = 4  # header + AM + PM + BP
+    grid_left = block_x + 132.0
+    grid_bottom = grid_top + row_height * rows
+    grid_right = grid_left + col_width * cols
+
+    # Draw column lines (vertical)
+    for idx in range(cols + 1):
+        x = grid_left + (idx * col_width)
+        page.draw_line(fitz.Point(x, grid_top), fitz.Point(x, grid_bottom), color=(0, 0, 0), width=1)
+    # Draw row separators (horizontal)
+    for idx in range(rows + 1):
+        y = grid_top + (idx * row_height)
+        page.draw_line(fitz.Point(grid_left, y), fitz.Point(grid_right, y), color=(0, 0, 0), width=1)
+
+    # Day headers
+    day_names = ["Tue", "Wed", "Thu"]
+    for idx, day in enumerate((28, 29, 30)):
+        x = grid_left + idx * col_width + 18
+        page.insert_text(fitz.Point(x, grid_top + 4), day_names[idx], fontsize=8, fontname="helv")
+        page.insert_text(fitz.Point(x, grid_top + 9), str(day), fontsize=10, fontname="helv")
+
+    # Left block content with rules and track labels
+    page.insert_text(fitz.Point(block_x, grid_top - 24), "Room 307-2", fontsize=11, fontname="helv")
+    page.insert_text(fitz.Point(block_x, grid_top - 14), "Metoprolol 25 mg by mouth", fontsize=11, fontname="helv")
+    page.insert_text(fitz.Point(block_x, grid_top - 4), "SBP < 110", fontsize=11, fontname="helv")
+    page.insert_text(fitz.Point(block_x, grid_top + 6), "AM", fontsize=11, fontname="helv")
+    page.insert_text(fitz.Point(block_x, grid_top + 16), "PM", fontsize=11, fontname="helv")
+    page.insert_text(fitz.Point(block_x, grid_top + 26), "BP", fontsize=11, fontname="helv")
+
+    # Due cell content for AM row (row index 1) in day 30 column to trigger HOLD-MISS
+    am_text_point = fitz.Point(grid_left + 2 * col_width + 6, grid_top + row_height - 5)
+    page.insert_text(am_text_point, "07:00 100/60", fontsize=8, fontname="helv")
+    # Add filler text in earlier day columns for balance
+    page.insert_text(fitz.Point(grid_left + 6, grid_top + row_height - 5), "—", fontsize=8, fontname="helv")
+    page.insert_text(fitz.Point(grid_left + col_width + 6, grid_top + row_height - 5), "—", fontsize=8, fontname="helv")
+    # BP measurement row for context
+    bp_text_point = fitz.Point(grid_left + 2 * col_width + 8, grid_top + row_height * 3 + 6)
+    page.insert_text(bp_text_point, "100/60", fontsize=8, fontname="helv")
+
+    # Footer mention of hall for detection reinforcement
+    page.insert_text(fitz.Point(200, 742), "Bridgeman - Chart Codes Legend", fontsize=10, fontname="helv")
+
     doc.save(path)
     doc.close()
 

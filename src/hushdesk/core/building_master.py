@@ -81,6 +81,8 @@ def _room_to_hall() -> Dict[str, str]:
 def canonicalize_room(s: str) -> str:
     s = str(s).strip().upper().replace(" ", "")
     if _CANON.match(s):
+        if s not in _room_to_hall():
+            raise ValueError(f"Unknown room: {s}")
         return s
     import re as _re
     m = _re.match(r"^([1-4]\d{2})(?:-?([AB]))?$", s)

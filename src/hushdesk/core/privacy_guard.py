@@ -11,14 +11,20 @@ _ALLOWED_WORDS = {
 _ROOM_RE  = re.compile(r"^[1-4]\d{2}-(1|2)$")
 _TIME_RE  = re.compile(r"^(?:[01]?\d|2[0-3]):[0-5]\d$")
 _DATE_RE  = re.compile(r"^\d{2}-\d{2}-\d{4}$")
+_CHUNK_RE = re.compile(r"\s+|[A-Za-z0-9:/'\-\(\)]+|[^\sA-Za-z0-9]+")
 
 def sanitize_line(line: str) -> str:
     halls = set(BM.halls())
-    chunks = re.findall(r"[A-Za-z0-9:/'\-\(\)]+|[^\sA-Za-z0-9]+", line)
+    chunks = _CHUNK_RE.findall(line)
     out: List[str] = []
     for tok in chunks:
+        if tok.isspace():
+            if out and not out[-1].isspace():
+                out.append(" ")
+            continue
         if re.search(r"[A-Za-z]", tok):
             low = tok.lower()
+            core = low.strip("()")
             if (
                 low in _ALLOWED_WORDS
                 or tok in halls
@@ -26,6 +32,7 @@ def sanitize_line(line: str) -> str:
                 or _TIME_RE.match(tok)
                 or _DATE_RE.match(tok)
                 or low == "x"
+                or core in _ALLOWED_WORDS
             ):
                 out.append(tok)
             else:

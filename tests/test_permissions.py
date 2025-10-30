@@ -1,6 +1,8 @@
 import os, stat
+import pytest
 from hushdesk.core.export.checklist_render import write_txt
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits are not enforced on Windows")
 def test_txt_is_private_mode(tmp_path):
     out = tmp_path / "out" / "bp.txt"
     header = {"date_str":"10-14-2025","hall":"Holaday","source":"file.pdf"}

@@ -176,7 +176,7 @@ def _cmd_bp_audit(args: argparse.Namespace) -> None:
     summary = payload["summary"]
     print(
         f"Reviewed: {summary['reviewed']} | Hold-Miss: {summary['hold_miss']} | "
-        f"Held-OK: {summary['held_ok']} | Compliant: {summary['compliant']} | DC'D: {summary['dcd']}"
+        f"Held-Appropriate: {summary['held_ok']} | Compliant (BP rules met): {summary['compliant']} | DC'D: {summary['dcd']}"
     )
     if summary["hold_miss"] > 0:
         raise SystemExit(2)
@@ -191,7 +191,7 @@ def _cmd_bp_audit_sim(args: argparse.Namespace) -> None:
     if args.summary_only:
         print(
             f"Reviewed: {summary['reviewed']} | Hold-Miss: {summary['hold_miss']} | "
-            f"Held-Appropriate: {summary['held_ok']} | Compliant: {summary['compliant']} | "
+            f"Held-Appropriate: {summary['held_ok']} | Compliant (BP rules met): {summary['compliant']} | "
             f"DC'D: {summary['dcd']}"
         )
         if summary["hold_miss"] > 0:

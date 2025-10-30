@@ -58,7 +58,7 @@ def parse_mar(path: str) -> ParseResult:
             raise last_error
         raise EngineUnavailable("Unable to extract words from PDF") from last_error
 
-    rows = extract_rows(words)
+    rows = extract_rows(words, source_path=path)
     matrix = rows_to_matrix(rows)
     records = _matrix_to_records(matrix)
     violations = _collect_violations(records)

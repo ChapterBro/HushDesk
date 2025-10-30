@@ -6,7 +6,9 @@ import time
 import sys
 import importlib
 import importlib.resources as pkg_resources
+from datetime import datetime, timedelta
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -23,8 +25,11 @@ except Exception:  # pragma: no cover - optional dependency
 from hushdesk.ui.theme import load_theme_name, save_theme_name, select_palette
 from hushdesk.ui.util import hall_from_rooms
 from hushdesk.pdf.backends import MuPdfBackend, PdfUnavailable, PlumberBackend, get_backend
-from hushdesk.core.engine import run_sim
-from hushdesk.pdf.mar_parser import parse_mar_pdf
+from hushdesk.core.engine import run_sim, run_pdf as pdf_engine
+from hushdesk.mar import parser as mar_parser
+from hushdesk.pdf.pdfio import extract_text_by_page
+from hushdesk.core.pdf.reader import open_pdf, page_text_spans
+from hushdesk.core.layout.grid import detect_day_columns, nearest_day_band
 from hushdesk.core import building_master as BM
 from hushdesk.version import APP_VERSION
 
@@ -57,20 +62,384 @@ def run_simulation(fixture_path: str, room_pattern: str | None = None) -> dict:
     return payload
 
 
+def _ensure_mmddyyyy(raw: str) -> Optional[str]:
+    if not raw:
+        return None
+    token = str(raw).strip()
+    if not token:
+        return None
+    cleaned = token.replace("_", "-").replace("/", "-")
+    candidates = [cleaned, cleaned.replace(" ", "-")]
+    for cand in candidates:
+        for fmt in ("%m-%d-%Y", "%Y-%m-%d", "%m%d%Y", "%Y%m%d"):
+            try:
+                dt_obj = datetime.strptime(cand, fmt)
+                return dt_obj.strftime("%m-%d-%Y")
+            except ValueError:
+                continue
+    return None
+
+
+def _infer_date_from_filename(pdf_path: str) -> Optional[str]:
+    name = Path(pdf_path).name
+    matches = re.findall(r"(\d{4}[-_]\d{2}[-_]\d{2}|\d{2}[-_]\d{2}[-_]\d{4}|\d{8})", name)
+    for candidate in matches:
+        normalized = _ensure_mmddyyyy(candidate)
+        if normalized:
+            return normalized
+    return None
+
+
+def _default_date_str() -> str:
+    return (datetime.now() - timedelta(days=1)).strftime("%m-%d-%Y")
+
+
+def _canonical_rooms(rooms: List[str]) -> List[str]:
+    canon: List[str] = []
+    for room in rooms:
+        try:
+            canon_room = BM.canonicalize_room(room)
+        except Exception:
+            continue
+        canon.append(canon_room)
+    if not canon:
+        return []
+    # Deduplicate while preserving sorted order for determinism
+    return sorted({c for c in canon})
+
+
+def _parse_day_from_date(date_str: str) -> int:
+    parts = date_str.split("-")
+    if len(parts) != 3:
+        raise ValueError(f"Unrecognized date format: {date_str}")
+    try:
+        return int(parts[1])
+    except ValueError as exc:
+        raise ValueError(f"Unrecognized date format: {date_str}") from exc
+
+
+@dataclass(slots=True)
+class DayColumnResolver:
+    pdf_path: str
+    pages: int
+    bands_by_page: Dict[int, Dict[int, tuple[float, float]]]
+
+    @classmethod
+    def build(cls, pdf_path: str) -> DayColumnResolver:
+        doc = open_pdf(pdf_path)
+        try:
+            pages = len(doc)
+            mapping: Dict[int, Dict[int, tuple[float, float]]] = {}
+            for page_index in range(pages):
+                spans = page_text_spans(doc, page_index)
+                if not spans:
+                    continue
+                day_spans = _collect_day_spans(spans)
+                if not day_spans:
+                    continue
+                bands = detect_day_columns(doc, page_index)
+                if not bands:
+                    continue
+                assignments: Dict[int, tuple[float, float]] = {}
+                for value, center in day_spans:
+                    band = nearest_day_band(bands, center)
+                    if band is None:
+                        continue
+                    assignments.setdefault(value, _expand_band(band))
+                if assignments:
+                    mapping[page_index] = assignments
+            return cls(pdf_path=pdf_path, pages=pages, bands_by_page=mapping)
+        finally:
+            doc.close()
+
+    def bands_for_day(self, day: int) -> Dict[int, tuple[float, float]]:
+        matches: Dict[int, tuple[float, float]] = {}
+        for page_index, page_map in self.bands_by_page.items():
+            band = page_map.get(day)
+            if band:
+                matches[page_index] = band
+        return matches
+
+
+def _collect_day_spans(spans: List[Dict[str, object]]) -> List[tuple[int, float]]:
+    day_spans: List[tuple[int, float]] = []
+    for span in spans:
+        text = str(span.get("text", "")).strip()
+        if not text or not text.isdigit():
+            continue
+        value = int(text)
+        if not (1 <= value <= 31):
+            continue
+        bbox = span.get("bbox") or (0.0, 0.0, 0.0, 0.0)
+        try:
+            x0, _, x1, _ = bbox  # type: ignore[misc]
+        except Exception:
+            continue
+        center = (float(x0) + float(x1)) / 2.0
+        day_spans.append((value, center))
+    return day_spans
+
+
+def _expand_band(band: tuple[float, float], *, pad_left: float = 6.0, pad_right: float = 24.0) -> tuple[float, float]:
+    left, right = band
+    return (max(0.0, left - pad_left), right + pad_right)
+
+
+@dataclass(slots=True)
+class HallDetection:
+    hall: Optional[str]
+    score: int
+    candidates: List[str]
+
+
+def _detect_hall_from_pdf(pdf_path: str) -> HallDetection:
+    hall_names = BM.halls()
+    if not hall_names:
+        return HallDetection(None, 0, [])
+    try:
+        doc = open_pdf(pdf_path)
+    except Exception:
+        return HallDetection(None, 0, [])
+
+    try:
+        strong_counts = {hall: 0 for hall in hall_names}
+        soft_counts = {hall: 0 for hall in hall_names}
+        max_pages = min(len(doc), 10)
+        for page_index in range(max_pages):
+            try:
+                page = doc.load_page(page_index)
+            except Exception:
+                page = None
+            spans = page_text_spans(doc, page_index)
+            if not spans:
+                continue
+            header_text: List[str] = []
+            footer_text: List[str] = []
+            all_text: List[str] = []
+            tops: List[float] = []
+            bottoms: List[float] = []
+            for span in spans:
+                text = str(span.get("text", "")).strip()
+                if not text:
+                    continue
+                bbox = span.get("bbox") or (0.0, 0.0, 0.0, 0.0)
+                try:
+                    top = float(bbox[1])
+                    bottom = float(bbox[3])
+                except Exception:
+                    continue
+                tops.append(top)
+                bottoms.append(bottom)
+                all_text.append(text)
+            if not all_text:
+                continue
+            min_y = min(tops)
+            max_y = max(bottoms)
+            span_height = max(max_y - min_y, 1.0)
+            header_limit = min_y + max(96.0, span_height * 0.18)
+            footer_limit = max_y - max(72.0, span_height * 0.12)
+            for span in spans:
+                text = str(span.get("text", "")).strip()
+                if not text:
+                    continue
+                bbox = span.get("bbox") or (0.0, 0.0, 0.0, 0.0)
+                try:
+                    top = float(bbox[1])
+                    bottom = float(bbox[3])
+                except Exception:
+                    continue
+                if top <= header_limit:
+                    header_text.append(text)
+                if bottom >= footer_limit:
+                    footer_text.append(text)
+            joined_header = " ".join(header_text).upper()
+            joined_footer = " ".join(footer_text).upper()
+            joined_body = " ".join(all_text).upper()
+            for hall in hall_names:
+                target = hall.upper()
+                if target and target in joined_header:
+                    strong_counts[hall] += 2
+                if target and target in joined_footer:
+                    strong_counts[hall] += 1
+                if target and target in joined_body:
+                    soft_counts[hall] += 1
+        best_hall, best_score = max(strong_counts.items(), key=lambda kv: kv[1])
+        if best_score <= 1:
+            best_hall = None
+        candidates = sorted(
+            hall_names,
+            key=lambda name: (strong_counts.get(name, 0), soft_counts.get(name, 0)),
+            reverse=True,
+        )
+        candidates = [c for c in candidates if strong_counts.get(c, 0) or soft_counts.get(c, 0)][:3]
+        return HallDetection(best_hall, best_score, candidates)
+    finally:
+        doc.close()
+
+
+def _build_preview_decisions(
+    pdf_path: str,
+    hall: str,
+    date_str: str,
+    rooms: List[str],
+    day_bands: Dict[int, tuple[float, float]],
+    page_count: int,
+) -> tuple[List[pdf_engine.DecisionRecord], Dict[str, object]]:
+    if not hall:
+        raise ValueError("Hall could not be identified.")
+    canonical = _canonical_rooms(rooms)
+    if not canonical:
+        raise ValueError("No recognizable rooms with parametered meds found.")
+    if not day_bands:
+        raise ValueError("Selected day not present in MAR header.")
+    page_indices = sorted(day_bands.keys())
+    decisions: List[pdf_engine.DecisionRecord] = []
+    for room in canonical:
+        recs = pdf_engine.extract_records_for_date(
+            pdf_path=pdf_path,
+            date_col_index=None,
+            date_str_us=date_str,
+            hall=hall,
+            room=room,
+            page_indices=page_indices,
+            date_bands=day_bands,
+        )
+        decisions.extend(recs)
+    header_meta = {
+        "date_str": date_str,
+        "hall": hall,
+        "source": Path(pdf_path).name,
+        "pages": page_count,
+    }
+    return decisions, header_meta
+
+
 def run_pdf_backend(pdf_path: str, date_str: str = "", room_filter: str | None = None) -> dict:
     try:
-        result = parse_mar_pdf(pdf_path)
-        return {
-            "ok": True,
-            "doses": [dose.__dict__ for dose in result.doses],
-            "notes": result.notes,
-            "meta": result.meta,
-        }
+        result = mar_parser.parse_mar(pdf_path)
     except Exception as exc:
-        return {
-            "ok": False,
-            "error": f"Failed to parse MAR: {exc}",
-        }
+        return {"ok": False, "error": f"Failed to parse MAR: {exc}"}
+
+    notes: List[str] = []
+    meta = dict(result.meta)
+    detection = _detect_hall_from_pdf(pdf_path)
+    hall_name = detection.hall or meta.get("hall") or None
+    if hall_name:
+        meta["hall"] = hall_name
+    meta["hall_detection"] = {
+        "hall": detection.hall,
+        "score": detection.score,
+        "candidates": detection.candidates,
+    }
+    if not detection.hall:
+        notes.append("Unable to confidently infer hall from MAR headers; set hall before exporting.")
+        if detection.candidates:
+            notes.append(f"Hall suggestions: {', '.join(detection.candidates)}")
+
+    normalized_date = _ensure_mmddyyyy(date_str) if date_str else None
+    if not normalized_date:
+        inferred = _infer_date_from_filename(pdf_path)
+        if inferred:
+            normalized_date = inferred
+            notes.append(f"Date inferred from file name: {normalized_date}")
+    if not normalized_date:
+        normalized_date = _default_date_str()
+        notes.append(f"Date defaulted to yesterday: {normalized_date}")
+    meta.setdefault("filters", {})["date"] = normalized_date
+
+    room_regex = None
+    if room_filter:
+        try:
+            room_regex = re.compile(room_filter)
+        except re.error as exc:
+            notes.append(f"Room filter ignored: {exc}")
+        else:
+            meta["filters"]["room"] = room_filter
+
+    doses = list(result.records)
+    scoped_records = doses
+    if hall_name:
+        hall_rooms = {BM.canonicalize_room(room) for room in BM.rooms_in_hall(hall_name)}
+        scoped: List[Dict[str, object]] = []
+        for record in doses:
+            room = str(record.get("room", "")).strip()
+            try:
+                canon = BM.canonicalize_room(room)
+            except Exception:
+                continue
+            if canon in hall_rooms:
+                scoped.append(record)
+        if scoped:
+            scoped_records = scoped
+    if room_regex:
+        filtered = [rec for rec in scoped_records if room_regex.search(str(rec.get("room", "")))]
+        scoped_records = filtered
+        if not filtered:
+            notes.append("Room filter produced no matching parametered meds.")
+    doses = scoped_records
+
+    summary = {
+        "reviewed": len(doses),
+        "hold_miss": 0,
+        "held_ok": 0,
+        "compliant": len(doses),
+        "dcd": 0,
+    }
+    sections: Dict[str, List[str]] = {"HOLD-MISS": [], "HELD-APPROPRIATE": [], "COMPLIANT": [], "DC'D": []}
+    header_payload: Dict[str, str] = {
+        "date_str": normalized_date,
+        "hall": hall_name or "",
+        "source": Path(pdf_path).name,
+    }
+
+    resolver: Optional[DayColumnResolver]
+    try:
+        resolver = DayColumnResolver.build(pdf_path)
+        meta.setdefault("pages", resolver.pages)
+    except Exception as exc:
+        resolver = None
+        notes.append(f"Unable to analyze day columns: {exc}")
+
+    try:
+        if hall_name:
+            rooms = sorted(BM.rooms_in_hall(hall_name))
+            if room_regex:
+                rooms = [room for room in rooms if room_regex.search(room)]
+            if not rooms:
+                raise ValueError("No rooms match the selected hall/filter.")
+            day_bands: Dict[int, tuple[float, float]] = {}
+            pages_count = resolver.pages if resolver else meta.get("pages", 0)
+            if resolver:
+                target_day = _parse_day_from_date(normalized_date)
+                day_bands = resolver.bands_for_day(target_day)
+            decisions, header_meta = _build_preview_decisions(
+                pdf_path=pdf_path,
+                hall=hall_name,
+                date_str=normalized_date,
+                rooms=rooms,
+                day_bands=day_bands,
+                page_count=pages_count if isinstance(pages_count, int) else 0,
+            )
+            preview_payload = run_sim.build_payload(decisions, header_meta=header_meta)
+            summary = preview_payload.get("summary", summary)
+            sections = preview_payload.get("sections", sections)
+            header_payload = preview_payload.get("header", header_meta)
+        else:
+            notes.append("Select or confirm the hall to enable preview metrics.")
+    except ValueError as exc:
+        notes.append(str(exc))
+    except Exception as exc:
+        notes.append(f"Preview summary unavailable: {exc}")
+
+    return {
+        "ok": True,
+        "doses": doses,
+        "notes": notes,
+        "meta": meta,
+        "summary": summary,
+        "sections": sections,
+        "header": header_payload,
+    }
 
 
 class HushDeskApp:
@@ -87,6 +456,7 @@ class HushDeskApp:
             "hall_override": None,
             "detected_hall": None,
             "detected_hall_num": None,
+            "hall_suggestions": [],
         }
         self._updating_hall_entry = False
         self._suppress_hall_events = False
@@ -219,10 +589,10 @@ class HushDeskApp:
         sum_row = tk.Frame(self.root, bg=p["bg"])
         sum_row.pack(fill="x", padx=12, pady=(0, 8))
         self.sum_lbls = {
-            "reviewed": ttk.Label(sum_row, text="Reviewed 0"),
+            "reviewed": ttk.Label(sum_row, text="Reviewed (parametered doses touched) 0"),
             "hold_miss": ttk.Label(sum_row, text="Hold-Miss 0"),
-            "held_ok": ttk.Label(sum_row, text="Held-OK 0"),
-            "compliant": ttk.Label(sum_row, text="Compliant 0"),
+            "held_ok": ttk.Label(sum_row, text="Held-Appropriate 0"),
+            "compliant": ttk.Label(sum_row, text="Compliant (accurate BP rules) 0"),
             "dcd": ttk.Label(sum_row, text="DC'D 0"),
         }
         self.sum_lbls["reviewed"].pack(side="left")
@@ -303,7 +673,7 @@ class HushDeskApp:
             tk.Label(frame, text=body, justify="left", wraplength=520, bg=p["bg"], fg=p["text"]).pack(anchor="w", pady=(0, 10))
 
         add_section("What HushDesk does", "Checks BP med pass compliance by matching hold rules to what was documented for each dose on the chosen date.")
-        add_section("What you'll see", "• Hold-Miss - should've been held, but was given.\n• Held-OK - valid hold code (4, 6, 11, 12, 15).\n• Compliant - given and within the rule.\n• DC'D - clearly X'd out for the day.\n• Reviewed - how many doses we checked.")
+        add_section("What you'll see", "• Hold-Miss - should've been held, but was given.\n• Held-Appropriate - valid hold code (4, 6, 11, 12, 15).\n• Compliant - accurately follows the BP hold rules.\n• DC'D - clearly X'd out for the day.\n• Reviewed - every parametered dose we touched.")
         add_section("Privacy", "• Runs completely offline. HushDesk never uses the internet.\n• Never stores PHI/PII (outputs are hall + room only).\n• Files you save remain on your machine with private permissions.\n• Encryption at rest is planned.")
         ttk.Button(frame, text="Got it", command=top.destroy).pack(anchor="e", pady=(4, 0))
 
@@ -553,6 +923,7 @@ class HushDeskApp:
         self.state["detected_hall"] = detected_hall
         self.state["detected_hall_num"] = detected_hall_num
         override = (self.state.get("hall_override") or "").strip()
+        suggestions = list(self.state.get("hall_suggestions") or [])
         if override:
             self.hall_var.set(f"Hall: {override} (chosen)")
             self._set_hall_entry_text(override)
@@ -565,12 +936,17 @@ class HushDeskApp:
             self.banner.pack_forget()
         else:
             message = "Hall not found in header. Type it or pick below."
+            if suggestions:
+                suggestion_text = ", ".join(suggestions[:3])
+                message = f"Hall not found in header. Suggestions: {suggestion_text}. Type it or pick below."
             self.hall_var.set(message)
             self.banner_msg.configure(text=message)
             self.banner.pack(fill="x", padx=12, pady=(0, 8))
             if not override:
                 self._set_hall_entry_text("")
                 self._set_hall_combo_value("")
+                if suggestions:
+                    self._set_hall_combo_value(suggestions[0])
         current = override or detected_hall or ""
         self.state["hall"] = current or None
         self._update_cached_payload_hall()
@@ -635,16 +1011,16 @@ class HushDeskApp:
         self.state["last_summary"] = summary
         nums = self.palette["summary_nums"]
         self.sum_lbls["reviewed"].configure(
-            text=f"Reviewed {int(summary.get('reviewed', 0))}", foreground=nums["reviewed"]
+            text=f"Reviewed (parametered doses touched) {int(summary.get('reviewed', 0))}", foreground=nums["reviewed"]
         )
         self.sum_lbls["hold_miss"].configure(
             text=f"Hold-Miss {int(summary.get('hold_miss', 0))}", foreground=nums["hold_miss"]
         )
         self.sum_lbls["held_ok"].configure(
-            text=f"Held-OK {int(summary.get('held_ok', 0))}", foreground=nums["held_ok"]
+            text=f"Held-Appropriate {int(summary.get('held_ok', 0))}", foreground=nums["held_ok"]
         )
         self.sum_lbls["compliant"].configure(
-            text=f"Compliant {int(summary.get('compliant', 0))}", foreground=nums["compliant"]
+            text=f"Compliant (accurate BP rules) {int(summary.get('compliant', 0))}", foreground=nums["compliant"]
         )
         self.sum_lbls["dcd"].configure(
             text=f"DC'D {int(summary.get('dcd', 0))}", foreground=nums["dcd"]
@@ -681,7 +1057,7 @@ class HushDeskApp:
                 child.destroy()
             mapping = [
                 ("HOLD-MISS", "HOLD-MISS"),
-                ("HELD-OK", "HELD-OK"),
+                ("HELD-APPROPRIATE", "HELD-Appropriate"),
                 ("COMPLIANT", "COMPLIANT"),
                 ("DC'D", "DC'D"),
             ]
@@ -712,10 +1088,11 @@ class HushDeskApp:
         toggle_btn = ttk.Button(header, text="Show", command=toggle)
         toggle_btn.pack(side="right", padx=12)
 
+
+
     def _render_pdf_preview(self, payload: dict) -> None:
-        doses = payload.get("doses", [])
         notes = payload.get("notes", [])
-        if not doses:
+        if not payload.get("doses"):
             ttk.Label(
                 self.results,
                 text="Couldn't find the MAR schedule grid on this PDF. Check the month header and Chart Codes legend are present.",
@@ -732,52 +1109,119 @@ class HushDeskApp:
 
         card = ttk.Frame(self.results, style="Card.TFrame")
         card.pack(fill="both", expand=True, pady=(8, 0))
-        header = tk.Frame(card, bg=self.palette.get("surface", self.palette["bg"]))
-        header.pack(fill="x")
-        ttk.Label(header, text="MAR Dose Preview", font=("Segoe UI", 11, "bold")).pack(side="left", padx=12, pady=8)
+        surface = self.palette.get("surface", self.palette["bg"])
+        header_frame = tk.Frame(card, bg=surface)
+        header_frame.pack(fill="x")
+        ttk.Label(header_frame, text="MAR Quick Review", font=("Segoe UI", 11, "bold")).pack(side="left", padx=12, pady=8)
 
-        body = tk.Frame(card, bg=self.palette.get("surface", self.palette["bg"]))
+        body = tk.Frame(card, bg=surface)
         body.pack(fill="both", expand=True, padx=12, pady=(0, 12))
 
-        for dose in doses:
-            container = tk.Frame(body, bg=self.palette.get("surface", self.palette["bg"]))
-            container.pack(fill="x", pady=4)
-            ttk.Label(
-                container,
-                text=dose.get("med", ""),
-                font=("Segoe UI", 10, "bold"),
-            ).pack(anchor="w")
+        header = payload.get("header", {})
+        date_display = header.get("date_str") or "--"
+        hall_display = header.get("hall") or "--"
+        meta_source = payload.get("meta", {}).get("source")
+        source_display = header.get("source") or meta_source or "MAR.pdf"
+        ttk.Label(body, text=f"Date: {date_display}", font=("Segoe UI", 10, "bold")).pack(
+            anchor="w", padx=12, pady=(2, 0)
+        )
+        ttk.Label(body, text=f"Hall: {hall_display}", font=("Segoe UI", 10, "bold")).pack(
+            anchor="w", padx=12, pady=(0, 0)
+        )
+        ttk.Label(body, text=f"Source: {source_display}", font=("Segoe UI", 10)).pack(
+            anchor="w", padx=12, pady=(0, 6)
+        )
 
-            timing_bits: List[str] = []
-            raw_time = dose.get("raw_time") or "-"
-            normalized = dose.get("normalized_time")
-            time_range = dose.get("time_range")
-            slot = dose.get("slot")
-            if normalized:
-                timing_bits.append(f"Normalized {normalized}")
-            if time_range:
-                timing_bits.append(f"Range {time_range}")
-            if slot:
-                timing_bits.append(f"Slot {slot}")
-            timing = " • ".join(timing_bits) if timing_bits else "No normalized time"
+        summary = payload.get("summary", {})
+        summary_lines = [
+            f"Reviewed: {int(summary.get('reviewed', 0))}",
+            f"Hold-Miss: {int(summary.get('hold_miss', 0))}",
+            f"Held-Appropriate: {int(summary.get('held_ok', 0))}",
+            f"Compliant (accurate BP rules): {int(summary.get('compliant', 0))}",
+            f"DC'D: {int(summary.get('dcd', 0))}",
+        ]
+        ttk.Label(
+            body,
+            text="\n".join(summary_lines),
+            font=("Segoe UI", 10),
+            justify="left",
+            wraplength=720,
+        ).pack(anchor="w", padx=12, pady=(0, 8))
+
+        sections = payload.get("sections", {})
+        hold_miss_items = list(sections.get("HOLD-MISS", []))
+        ttk.Label(body, text="HOLD-MISS", font=("Segoe UI", 10, "bold"), foreground=self.palette["danger"]).pack(
+            anchor="w", padx=12, pady=(0, 2)
+        )
+        if hold_miss_items:
+            for line in hold_miss_items:
+                formatted = line.replace(" - ", " \u2014 ", 1)
+                ttk.Label(
+                    body,
+                    text=formatted,
+                    wraplength=720,
+                    justify="left",
+                ).pack(anchor="w", padx=20, pady=2)
+        else:
             ttk.Label(
-                container,
-                text=f"Raw {raw_time} — {timing}",
+                body,
+                text="-- none --",
                 style="Muted.TLabel",
                 wraplength=720,
                 justify="left",
-            ).pack(anchor="w", padx=8)
-            ttk.Label(
-                container,
-                text=f"Cell: {dose.get('cell', '')}",
-                wraplength=720,
-                justify="left",
-            ).pack(anchor="w", padx=8, pady=(0, 2))
+            ).pack(anchor="w", padx=20, pady=2)
+
+        meta_info = payload.get("meta", {})
+        reviewed_total = summary.get("reviewed")
+        if reviewed_total is None:
+            reviewed_total = len(payload.get("doses", []))
+        ttk.Label(
+            body,
+            text=f"Parsed doses: {int(reviewed_total)} | Pages scanned: {meta_info.get('pages', '?')}",
+            style="Muted.TLabel",
+            wraplength=720,
+            justify="left",
+        ).pack(anchor="w", padx=12, pady=(10, 4))
+
+        guidance_text = (
+            "Run the full audit to export the checklist and drill into each hold reason."
+            if hold_miss_items
+            else "Run the full audit to export the checklist and confirm chart codes."
+        )
+        ttk.Label(
+            body,
+            text=guidance_text,
+            style="Muted.TLabel",
+            wraplength=720,
+            justify="left",
+        ).pack(anchor="w", padx=12, pady=(0, 6))
 
         for note in notes:
             ttk.Label(body, text=f"Note: {note}", style="Muted.TLabel", wraplength=720, justify="left").pack(
                 anchor="w", pady=2
             )
+
+    def _apply_hall_detection(self, payload: dict, fallback: tuple[Optional[str], Optional[int]] | None = None) -> None:
+        meta = payload.get("meta") or {}
+        detection = meta.get("hall_detection") or {}
+        suggestions = list(detection.get("candidates") or [])
+        self.state["hall_suggestions"] = suggestions
+        detected = detection.get("hall")
+        hall_num: Optional[int | str] = None
+        if detected:
+            try:
+                rooms = list(BM.rooms_in_hall(detected))
+                hall_guess, hall_guess_num = hall_from_rooms(rooms[:4] or rooms)
+                detected = hall_guess or detected
+                hall_num = hall_guess_num
+            except Exception:
+                hall_num = None
+        elif fallback:
+            detected, hall_num = fallback
+        else:
+            detected = self.state.get("detected_hall")
+            hall_num = self.state.get("detected_hall_num")
+        self._refresh_hall_status(detected, hall_num)
 
     def _render_pdf_error(self, message: str) -> None:
         self._clear_results()
@@ -791,6 +1235,7 @@ class HushDeskApp:
         ).pack(anchor="w", padx=12, pady=(12, 4))
 
     def _handle_pdf_preview_result(self, payload: dict, elapsed: float) -> None:
+        self._apply_hall_detection(payload)
         error_message = ""
         if not payload.get("ok", False):
             error_message = payload.get("error", "Failed to parse MAR.")
@@ -803,16 +1248,17 @@ class HushDeskApp:
             self.footer_time.configure(text=f"Time: {elapsed:.1f}s")
             return
 
-        doses = payload.get("doses", [])
-        self._set_summary(
-            {
+        summary = payload.get("summary")
+        if not summary:
+            doses = payload.get("doses", [])
+            summary = {
                 "reviewed": len(doses),
                 "hold_miss": 0,
                 "held_ok": 0,
                 "compliant": len(doses),
                 "dcd": 0,
             }
-        )
+        self._set_summary(summary)
         self._clear_results()
         self._render_pdf_preview(payload)
         self.footer_time.configure(text=f"Time: {elapsed:.1f}s")
@@ -874,10 +1320,18 @@ class HushDeskApp:
         if "header" not in payload:
             return
         rooms = payload.get("rooms", [])
-        hall, hall_num = hall_from_rooms(rooms)
+        fallback: tuple[Optional[str], Optional[int]] | None = None
+        if rooms:
+            try:
+                hall_guess, hall_num = hall_from_rooms(rooms)
+                if hall_guess:
+                    fallback = (hall_guess, hall_num)
+            except Exception:
+                fallback = None
         header_hall = (payload.get("header") or {}).get("hall")
-        detected = header_hall or hall
-        self._refresh_hall_status(detected, hall_num)
+        if header_hall:
+            fallback = (header_hall, fallback[1] if fallback else None)
+        self._apply_hall_detection(payload, fallback=fallback)
         self.audit_date_var.set(f"Audit Date: {payload['header']['date_str']} (Central)")
 
     def _after_start(self, text: str, mode: str) -> None:
@@ -1041,4 +1495,7 @@ def main() -> None:  # pragma: no cover - UI entry point
 
 if __name__ == "__main__":  # pragma: no cover
     main()
+
+
+
 

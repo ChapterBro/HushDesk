@@ -65,8 +65,10 @@ def cell_bbox(block, track_band: Band, day_band: XBand) -> Tuple[float,float,flo
     x0, x1 = day_band
     y0, y1 = track_band
     bx0, by0, bx1, by1 = block.bbox
-    # grid starts to the right of the block
-    return (max(x0, bx1), y0, x1, y1)
+    # grid starts to the right of the block; shift top slightly to avoid header numerals bleeding into due text
+    offset = min(6.0, max(0.0, (y1 - y0) * 0.4))
+    adj_y0 = y0 + offset
+    return (max(x0, bx1), adj_y0, x1, y1)
 
 def nearest_day_band(day_bands: List[XBand], x_center: float):
     if not day_bands:

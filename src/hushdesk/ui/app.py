@@ -314,7 +314,13 @@ def _build_preview_decisions(
     return decisions, header_meta
 
 
-def run_pdf_backend(pdf_path: str, date_str: str = "", room_filter: str | None = None) -> dict:
+def run_pdf_backend(
+    pdf_path: str,
+    *,
+    date_str: str = "",
+    room_filter: str | None = None,
+    hall_override: str | None = None,
+) -> dict:
     try:
         result = mar_parser.parse_mar(pdf_path)
     except Exception as exc:
@@ -323,18 +329,45 @@ def run_pdf_backend(pdf_path: str, date_str: str = "", room_filter: str | None =
     notes: List[str] = []
     meta = dict(result.meta)
     detection = _detect_hall_from_pdf(pdf_path)
-    hall_name = detection.hall or meta.get("hall") or None
+    hall_source: Optional[str] = None
+    hall_name: Optional[str] = None
+    override_value = (hall_override or "").strip()
+    if override_value:
+        hall_source = "override"
+        lowered = override_value.lower()
+        hall_name = next((cand for cand in BM.halls() if cand.lower() == lowered), override_value)
+    else:
+        hall_name = detection.hall or meta.get("hall") or None
+        if hall_name:
+            hall_source = "detected"
+    applied_suggestion = False
+    if not hall_name and detection.candidates:
+        hall_name = detection.candidates[0]
+        hall_source = "suggested"
+        applied_suggestion = True
     if hall_name:
         meta["hall"] = hall_name
-    meta["hall_detection"] = {
+    hall_detection_payload: Dict[str, object] = {
         "hall": detection.hall,
         "score": detection.score,
         "candidates": detection.candidates,
     }
+    if hall_source:
+        hall_detection_payload["preview_source"] = hall_source
+    if applied_suggestion:
+        hall_detection_payload["preview_hall"] = hall_name
+        hall_detection_payload["applied_suggestion"] = True
+    meta["hall_detection"] = hall_detection_payload
+    if hall_source:
+        meta["hall_source"] = hall_source
     if not detection.hall:
         notes.append("Unable to confidently infer hall from MAR headers; set hall before exporting.")
         if detection.candidates:
             notes.append(f"Hall suggestions: {', '.join(detection.candidates)}")
+    if hall_source == "override":
+        notes.append(f"Preview metrics use hall override: {hall_name}.")
+    elif hall_source == "suggested":
+        notes.append(f"Preview metrics use hall suggestion: {hall_name}. Update if incorrect.")
 
     normalized_date = _ensure_mmddyyyy(date_str) if date_str else None
     if not normalized_date:
@@ -346,6 +379,8 @@ def run_pdf_backend(pdf_path: str, date_str: str = "", room_filter: str | None =
         normalized_date = _default_date_str()
         notes.append(f"Date defaulted to yesterday: {normalized_date}")
     meta.setdefault("filters", {})["date"] = normalized_date
+    if hall_name:
+        meta["filters"]["hall"] = hall_name
 
     room_regex = None
     if room_filter:
@@ -400,6 +435,7 @@ def run_pdf_backend(pdf_path: str, date_str: str = "", room_filter: str | None =
         resolver = None
         notes.append(f"Unable to analyze day columns: {exc}")
 
+    rooms_payload: List[str] = []
     try:
         if hall_name:
             rooms = sorted(BM.rooms_in_hall(hall_name))
@@ -424,12 +460,14 @@ def run_pdf_backend(pdf_path: str, date_str: str = "", room_filter: str | None =
             summary = preview_payload.get("summary", summary)
             sections = preview_payload.get("sections", sections)
             header_payload = preview_payload.get("header", header_meta)
+            rooms_payload = list(preview_payload.get("rooms", []))
         else:
             notes.append("Select or confirm the hall to enable preview metrics.")
     except ValueError as exc:
         notes.append(str(exc))
     except Exception as exc:
         notes.append(f"Preview summary unavailable: {exc}")
+        rooms_payload = []
 
     return {
         "ok": True,
@@ -439,6 +477,7 @@ def run_pdf_backend(pdf_path: str, date_str: str = "", room_filter: str | None =
         "summary": summary,
         "sections": sections,
         "header": header_payload,
+        "rooms": rooms_payload,
     }
 
 
@@ -924,13 +963,16 @@ class HushDeskApp:
         self.state["detected_hall_num"] = detected_hall_num
         override = (self.state.get("hall_override") or "").strip()
         suggestions = list(self.state.get("hall_suggestions") or [])
+        hall_source = self.state.get("hall_source")
         if override:
-            self.hall_var.set(f"Hall: {override} (chosen)")
+            suffix = " (override)" if hall_source == "override" else " (chosen)"
+            self.hall_var.set(f"Hall: {override}{suffix}")
             self._set_hall_entry_text(override)
             self._set_hall_combo_value(override)
             self.banner.pack_forget()
         elif detected_hall and detected_hall_num:
-            self.hall_var.set(f"Hall: {detected_hall_num} (auto)")
+            suffix = " (suggested)" if hall_source == "suggested" else " (auto)"
+            self.hall_var.set(f"Hall: {detected_hall_num}{suffix}")
             self._set_hall_entry_text(detected_hall)
             self._set_hall_combo_value(detected_hall)
             self.banner.pack_forget()
@@ -939,6 +981,8 @@ class HushDeskApp:
             if suggestions:
                 suggestion_text = ", ".join(suggestions[:3])
                 message = f"Hall not found in header. Suggestions: {suggestion_text}. Type it or pick below."
+                if hall_source == "suggested":
+                    message = f"Using hall suggestion {suggestions[0]} for preview. Confirm or adjust below."
             self.hall_var.set(message)
             self.banner_msg.configure(text=message)
             self.banner.pack(fill="x", padx=12, pady=(0, 8))
@@ -991,7 +1035,9 @@ class HushDeskApp:
                 pass
         return backend
 
-    def _run_pdf_pipeline(self, path: Path, backend: Any, room_pattern: str | None) -> dict:
+    def _run_pdf_pipeline(
+        self, path: Path, backend: Any, room_pattern: str | None, hall_override: str | None
+    ) -> dict:
         if isinstance(backend, MuPdfBackend):
             backend_name = "mupdf"
             self._preflight_status["mupdf"] = True
@@ -1003,7 +1049,7 @@ class HushDeskApp:
         self.state["pdf_backend"] = backend_name
         if hasattr(self, "preflight_var"):
             self.preflight_var.set(self._format_preflight_status())
-        return run_pdf_backend(str(path), date_str="", room_filter=room_pattern)
+        return run_pdf_backend(str(path), date_str="", room_filter=room_pattern, hall_override=hall_override)
 
     # ------------------------------------------------------------------
     # Rendering helpers
@@ -1117,20 +1163,41 @@ class HushDeskApp:
         body = tk.Frame(card, bg=surface)
         body.pack(fill="both", expand=True, padx=12, pady=(0, 12))
 
+        text = tk.Text(
+            body,
+            wrap="word",
+            font=("Segoe UI", 10),
+            bg=surface,
+            fg=self.palette["text"],
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=0,
+            exportselection=True,
+            cursor="arrow",
+        )
+        text.configure(insertbackground=self.palette["text"])
+        text.pack(fill="both", expand=True)
+        text.tag_configure("bold", font=("Segoe UI", 10, "bold"))
+        text.tag_configure("section", font=("Segoe UI", 10, "bold"), foreground=self.palette["danger"])
+        text.tag_configure("muted", foreground=self.palette.get("muted", "#6c757d"))
+
         header = payload.get("header", {})
+        meta_info = payload.get("meta", {})
         date_display = header.get("date_str") or "--"
         hall_display = header.get("hall") or "--"
-        meta_source = payload.get("meta", {}).get("source")
+        hall_source = meta_info.get("hall_source")
+        if hall_display != "--" and hall_source:
+            if hall_source == "suggested":
+                hall_display = f"{hall_display} (suggested)"
+            elif hall_source == "override":
+                hall_display = f"{hall_display} (override)"
+            elif hall_source == "detected":
+                hall_display = f"{hall_display} (auto)"
+        meta_source = meta_info.get("source")
         source_display = header.get("source") or meta_source or "MAR.pdf"
-        ttk.Label(body, text=f"Date: {date_display}", font=("Segoe UI", 10, "bold")).pack(
-            anchor="w", padx=12, pady=(2, 0)
-        )
-        ttk.Label(body, text=f"Hall: {hall_display}", font=("Segoe UI", 10, "bold")).pack(
-            anchor="w", padx=12, pady=(0, 0)
-        )
-        ttk.Label(body, text=f"Source: {source_display}", font=("Segoe UI", 10)).pack(
-            anchor="w", padx=12, pady=(0, 6)
-        )
+        text.insert("end", f"Date: {date_display}\n", ("bold",))
+        text.insert("end", f"Hall: {hall_display}\n", ("bold",))
+        text.insert("end", f"Source: {source_display}\n\n")
 
         summary = payload.get("summary", {})
         summary_lines = [
@@ -1140,74 +1207,84 @@ class HushDeskApp:
             f"Compliant (accurate BP rules): {int(summary.get('compliant', 0))}",
             f"DC'D: {int(summary.get('dcd', 0))}",
         ]
-        ttk.Label(
-            body,
-            text="\n".join(summary_lines),
-            font=("Segoe UI", 10),
-            justify="left",
-            wraplength=720,
-        ).pack(anchor="w", padx=12, pady=(0, 8))
+        text.insert("end", "\n".join(summary_lines) + "\n\n")
 
         sections = payload.get("sections", {})
         hold_miss_items = list(sections.get("HOLD-MISS", []))
-        ttk.Label(body, text="HOLD-MISS", font=("Segoe UI", 10, "bold"), foreground=self.palette["danger"]).pack(
-            anchor="w", padx=12, pady=(0, 2)
-        )
+        text.insert("end", "HOLD-MISS\n", ("section",))
         if hold_miss_items:
             for line in hold_miss_items:
                 formatted = line.replace(" - ", " \u2014 ", 1)
-                ttk.Label(
-                    body,
-                    text=formatted,
-                    wraplength=720,
-                    justify="left",
-                ).pack(anchor="w", padx=20, pady=2)
+                text.insert("end", f"  {formatted}\n")
         else:
-            ttk.Label(
-                body,
-                text="-- none --",
-                style="Muted.TLabel",
-                wraplength=720,
-                justify="left",
-            ).pack(anchor="w", padx=20, pady=2)
+            text.insert("end", "  -- none --\n", ("muted",))
 
-        meta_info = payload.get("meta", {})
         reviewed_total = summary.get("reviewed")
         if reviewed_total is None:
             reviewed_total = len(payload.get("doses", []))
-        ttk.Label(
-            body,
-            text=f"Parsed doses: {int(reviewed_total)} | Pages scanned: {meta_info.get('pages', '?')}",
-            style="Muted.TLabel",
-            wraplength=720,
-            justify="left",
-        ).pack(anchor="w", padx=12, pady=(10, 4))
+        text.insert(
+            "end",
+            f"\nParsed doses: {int(reviewed_total)} | Pages scanned: {meta_info.get('pages', '?')}\n",
+            ("muted",),
+        )
 
         guidance_text = (
             "Run the full audit to export the checklist and drill into each hold reason."
             if hold_miss_items
             else "Run the full audit to export the checklist and confirm chart codes."
         )
-        ttk.Label(
-            body,
-            text=guidance_text,
-            style="Muted.TLabel",
-            wraplength=720,
-            justify="left",
-        ).pack(anchor="w", padx=12, pady=(0, 6))
+        text.insert("end", f"{guidance_text}\n", ("muted",))
 
         for note in notes:
-            ttk.Label(body, text=f"Note: {note}", style="Muted.TLabel", wraplength=720, justify="left").pack(
-                anchor="w", pady=2
-            )
+            text.insert("end", f"\nNote: {note}\n", ("muted",))
+
+        allowed_nav = {
+            "Left",
+            "Right",
+            "Up",
+            "Down",
+            "Home",
+            "End",
+            "Prior",
+            "Next",
+        }
+
+        def _block_edit(event: tk.Event) -> str | None:
+            control = bool(event.state & 0x0004)
+            if control and event.keysym.lower() in {"c", "a"}:
+                return None
+            if event.keysym in allowed_nav:
+                return None
+            if event.keysym in {"Shift_L", "Shift_R", "Control_L", "Control_R"}:
+                return None
+            return "break"
+
+        text.bind("<KeyPress>", _block_edit)
+        text.bind("<<Paste>>", lambda e: "break")
+        text.bind("<<Cut>>", lambda e: "break")
+        text.bind("<Delete>", lambda e: "break")
+        text.bind("<BackSpace>", lambda e: "break")
 
     def _apply_hall_detection(self, payload: dict, fallback: tuple[Optional[str], Optional[int]] | None = None) -> None:
         meta = payload.get("meta") or {}
         detection = meta.get("hall_detection") or {}
         suggestions = list(detection.get("candidates") or [])
         self.state["hall_suggestions"] = suggestions
+        self.state["hall_source"] = detection.get("preview_source") or meta.get("hall_source")
         detected = detection.get("hall")
         hall_num: Optional[int | str] = None
+        if fallback is None:
+            header_hall = (payload.get("header") or {}).get("hall") or None
+            if header_hall:
+                try:
+                    rooms = list(BM.rooms_in_hall(header_hall))
+                except Exception:
+                    rooms = []
+                if rooms:
+                    hall_guess, hall_guess_num = hall_from_rooms(rooms[:4] or rooms)
+                    fallback = (hall_guess or header_hall, hall_guess_num)
+                else:
+                    fallback = (header_hall, None)
         if detected:
             try:
                 rooms = list(BM.rooms_in_hall(detected))
@@ -1278,7 +1355,8 @@ class HushDeskApp:
             payload = run_simulation(str(path), room_pattern)
         elif suffix == ".pdf":
             backend = self._ensure_pdf_backend(path)
-            payload = self._run_pdf_pipeline(path, backend, room_pattern)
+            hall_override = (self.state.get("hall_override") or "").strip() or None
+            payload = self._run_pdf_pipeline(path, backend, room_pattern, hall_override)
         else:
             raise RuntimeError("Unsupported file type. Use a MAR PDF or fixture JSON.")
         self._apply_hall_override_to_payload(payload)

@@ -457,10 +457,18 @@ def run_pdf_backend(
                 page_count=pages_count if isinstance(pages_count, int) else 0,
             )
             preview_payload = run_sim.build_payload(decisions, header_meta=header_meta)
-            summary = preview_payload.get("summary", summary)
-            sections = preview_payload.get("sections", sections)
-            header_payload = preview_payload.get("header", header_meta)
-            rooms_payload = list(preview_payload.get("rooms", []))
+            preview_records = list(preview_payload.get("records", []))
+            if preview_records:
+                summary = preview_payload.get("summary", summary)
+                sections = preview_payload.get("sections", sections)
+                header_payload = preview_payload.get("header", header_meta)
+                rooms_payload = list(preview_payload.get("rooms", []))
+            else:
+                rooms_payload = list(preview_payload.get("rooms", [])) or rooms_payload
+                if doses:
+                    notes.append(
+                        "Preview metrics unavailable: no parametered meds matched the selected hall/day; showing raw parse counts."
+                    )
         else:
             notes.append("Select or confirm the hall to enable preview metrics.")
     except ValueError as exc:

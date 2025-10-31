@@ -4,8 +4,10 @@ from pathlib import Path
 from typing import Iterable, Iterator, List, Sequence
 import pytest
 
+from hushdesk.pdf._mupdf import import_fitz
+
 try:
-    import fitz  # PyMuPDF
+    fitz = import_fitz(optional=True)  # PyMuPDF
 except Exception:  # pragma: no cover
     fitz = None
 

@@ -3,16 +3,16 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable, Iterator
 
+from .._mupdf import import_fitz
 from ..engine_base import EngineUnavailable, Word
 
 
 class MuPdfEngine:
     def __init__(self) -> None:
         try:
-            import fitz  # type: ignore
+            self._fitz = import_fitz()
         except Exception as exc:  # pragma: no cover - import guard
             raise EngineUnavailable("MuPDF (PyMuPDF) not available") from exc
-        self._fitz = fitz
 
     def extract_words(self, path: str) -> Iterable[Word]:
         doc_path = Path(path)

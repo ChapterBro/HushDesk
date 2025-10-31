@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import List
 
+from ._mupdf import import_fitz
+
 
 def extract_text_by_page(path: str) -> List[List[str]]:
     """
@@ -47,10 +49,9 @@ def _normalize_lines(text: str) -> List[str]:
 
 
 def _extract_with_pymupdf(path: str) -> List[List[str]] | None:
-    try:
-        import fitz  # type: ignore
-    except Exception as exc:
-        raise ModuleNotFoundError("fitz") from exc
+    fitz = import_fitz(optional=True)
+    if fitz is None:
+        raise ModuleNotFoundError("fitz")
 
     doc = fitz.open(path)  # type: ignore[attr-defined]
     try:
@@ -99,4 +100,3 @@ def _extract_with_pdfminer(path: str) -> List[List[str]] | None:
                     lines.append(line_text)
         pages.append(lines)
     return pages
-

@@ -7,12 +7,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+from ._mupdf import import_fitz
 from .engine_base import Cell, Row, Word
 
-try:  # Optional at runtime; guarded for fallback engines.
-    import fitz  # type: ignore
-except Exception:  # pragma: no cover - executed when PyMuPDF missing
-    fitz = None  # type: ignore
+fitz = import_fitz(optional=True)  # type: ignore[assignment]
 
 GridBand = Tuple[float, float]
 Segments = List[Tuple[float, float, float, float]]
@@ -263,4 +261,3 @@ def _dump_debug(
     except Exception:
         # Debug hooks must never break normal parsing.
         return
-

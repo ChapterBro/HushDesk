@@ -1,5 +1,7 @@
 from typing import Any
 
+from ._mupdf import import_fitz
+
 
 class PdfUnavailable(Exception):
     pass
@@ -16,9 +18,7 @@ class MuPdfBackend(PdfBackend):
     name = "mupdf"
 
     def __init__(self):
-        import fitz  # PyMuPDF
-
-        self._fitz = fitz
+        self._fitz = import_fitz()  # PyMuPDF
 
     def open(self, path: str):
         return self._fitz.open(path)

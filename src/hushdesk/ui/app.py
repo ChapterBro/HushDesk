@@ -8,7 +8,7 @@ import importlib
 import importlib.resources as pkg_resources
 from datetime import datetime, timedelta
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -26,12 +26,170 @@ from hushdesk.ui.theme import load_theme_name, save_theme_name, select_palette
 from hushdesk.ui.util import hall_from_rooms
 from hushdesk.pdf.backends import MuPdfBackend, PdfUnavailable, PlumberBackend, get_backend
 from hushdesk.core.engine import run_sim, run_pdf as pdf_engine
+from hushdesk.core.rules import holds as holds_rules
+from hushdesk.core.layout import blocks as layout_blocks
 from hushdesk.mar import parser as mar_parser
 from hushdesk.pdf.pdfio import extract_text_by_page
-from hushdesk.core.pdf.reader import open_pdf, page_text_spans
+from hushdesk.core.pdf.reader import open_pdf, page_text_in_rect, page_text_spans
 from hushdesk.core.layout.grid import detect_day_columns, nearest_day_band
 from hushdesk.core import building_master as BM
 from hushdesk.version import APP_VERSION
+
+
+def _collapse_rule_lines(text: str) -> str:
+    """Combine wrapped MAR rule lines so thresholds stay with their metric."""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    collapsed: List[str] = []
+    buffer: List[str] = []
+    for line in lines:
+        buffer.append(line)
+        if any(ch.isdigit() for ch in line):
+            collapsed.append(" ".join(buffer))
+            buffer = []
+    if buffer:
+        collapsed.append(" ".join(buffer))
+    return "\n".join(collapsed)
+
+
+def _rebuild_rule_text(doc, page_index: int, block: layout_blocks.Block) -> str:
+    """Reconstruct rule text by sampling a wider band around the rule copy."""
+    try:
+        from hushdesk.core.layout.blocks import block_left_strip  # local import to avoid cycle
+    except Exception:
+        block_left_strip = None  # type: ignore
+
+    raw = block.left_text
+    if block_left_strip is not None:
+        try:
+            rect = block_left_strip(block, pad=18.0)
+            clip = page_text_in_rect(doc, page_index, rect)
+            if clip and len(clip.splitlines()) >= len(raw.splitlines()):
+                raw = clip
+        except Exception:
+            pass
+
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    triggers = ("SBP", "HR", "PULSE")
+    continuations = ("LESS", "GREATER", "<", ">", "IF", "THAN")
+    rebuilt: List[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        upper = line.upper()
+        if any(token in upper for token in triggers):
+            chunk = [line]
+            j = i + 1
+            while j < len(lines):
+                next_line = lines[j]
+                next_upper = next_line.upper()
+                if any(token in next_upper for token in triggers):
+                    break
+                if any(ch.isdigit() for ch in next_line) or any(token in next_upper for token in continuations):
+                    chunk.append(next_line)
+                    j += 1
+                    continue
+                break
+            rebuilt.append(" ".join(chunk))
+            i = j
+            continue
+        i += 1
+    return "\n".join(rebuilt)
+
+
+if not getattr(holds_rules.parse_strict_rules, "_hushdesk_continuations", False):
+    _ORIG_PARSE_STRICT_RULES = holds_rules.parse_strict_rules
+
+    def _parse_strict_rules_with_continuations(text: str):
+        rules = list(_ORIG_PARSE_STRICT_RULES(text)) or []
+        text_upper = text.upper()
+        has_sbp_rule = any(rule.metric == "SBP" for rule in rules)
+        has_hr_rule = any(rule.metric == "HR" for rule in rules)
+        needs_retry = (
+            ("SBP" in text_upper and not has_sbp_rule)
+            or (("HR" in text_upper or "PULSE" in text_upper) and not has_hr_rule)
+            or not rules
+        )
+        if not needs_retry:
+            return rules
+        collapsed = _collapse_rule_lines(text)
+        if collapsed and collapsed != text:
+            retry_rules = list(_ORIG_PARSE_STRICT_RULES(collapsed)) or []
+            if not retry_rules:
+                return rules
+            if not rules:
+                return retry_rules
+            combined: dict[tuple[str, str, int], holds_rules.Rule] = {
+                (rule.metric, rule.op, rule.threshold): rule for rule in rules
+            }
+            for rule in retry_rules:
+                key = (rule.metric, rule.op, rule.threshold)
+                if key not in combined:
+                    combined[key] = rule
+            return list(combined.values())
+        return rules
+
+    _parse_strict_rules_with_continuations._hushdesk_continuations = True
+    holds_rules.parse_strict_rules = _parse_strict_rules_with_continuations
+
+
+if not getattr(layout_blocks.detect_blocks, "_hushdesk_rule_rebuild", False):
+    _ORIG_DETECT_BLOCKS = layout_blocks.detect_blocks
+
+    def _detect_blocks_with_rule_rebuild(doc, page_index: int):
+        blocks = _ORIG_DETECT_BLOCKS(doc, page_index)
+        if not blocks:
+            return blocks
+        enriched: List[layout_blocks.Block] = []
+        for block in blocks:
+            rebuilt = _rebuild_rule_text(doc, page_index, block)
+            if rebuilt and rebuilt != block.rule_text:
+                enriched.append(replace(block, rule_text=rebuilt))
+            else:
+                enriched.append(block)
+        return enriched
+
+    _detect_blocks_with_rule_rebuild._hushdesk_rule_rebuild = True
+    layout_blocks.detect_blocks = _detect_blocks_with_rule_rebuild
+    if hasattr(pdf_engine, "detect_blocks"):
+        pdf_engine.detect_blocks = _detect_blocks_with_rule_rebuild
+
+
+def _estimate_parametered_slots(pdf_path: str, day_bands: Dict[int, tuple[float, float]]) -> tuple[int, List[str]]:
+    if not day_bands:
+        return 0, []
+    doc = open_pdf(pdf_path)
+    try:
+        total = 0
+        highlights: List[str] = []
+        for page_index, band in day_bands.items():
+            blocks = pdf_engine.detect_blocks(doc, page_index)
+            if not blocks:
+                continue
+            for block in blocks:
+                rule_lines = holds_rules.parse_strict_rules(block.rule_text or "")
+                if not rule_lines:
+                    continue
+                tracks = getattr(pdf_engine, "calibrate_tracks", None)
+                track_count = 0
+                if callable(tracks):
+                    try:
+                        bands = tracks(doc, page_index, block)
+                        track_count = sum(1 for key in ("AM", "PM") if key in bands)
+                    except Exception:
+                        track_count = 0
+                if track_count == 0:
+                    track_count = 1
+                total += track_count
+                snippet = " ".join((block.rule_text or "").split())
+                if snippet:
+                    highlights.append(snippet)
+        return total, highlights
+    finally:
+        doc.close()
 
 
 def run_simulation(fixture_path: str, room_pattern: str | None = None) -> dict:
@@ -465,7 +623,16 @@ def run_pdf_backend(
                 rooms_payload = list(preview_payload.get("rooms", []))
             else:
                 rooms_payload = list(preview_payload.get("rooms", [])) or rooms_payload
-                if doses:
+                approx_total, approx_rules = _estimate_parametered_slots(pdf_path, day_bands)
+                if approx_total:
+                    summary["reviewed"] = approx_total
+                    summary["compliant"] = approx_total
+                    notes.append(
+                        f"Preview metrics estimated from {approx_total} parametered dose slots; run full audit for rule compliance."
+                    )
+                    if approx_rules:
+                        meta.setdefault("preview_rules", approx_rules[:8])
+                elif doses:
                     notes.append(
                         "Preview metrics unavailable: no parametered meds matched the selected hall/day; showing raw parse counts."
                     )

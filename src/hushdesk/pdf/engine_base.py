@@ -49,6 +49,7 @@ class Row:
     y0: float
     y1: float
     page: int
+    meta: dict[str, object] | None = None
 
 
 class PdfEngine(Protocol):

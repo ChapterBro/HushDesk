@@ -9,7 +9,7 @@ import importlib.resources as pkg_resources
 from datetime import datetime, timedelta
 from pathlib import Path
 from dataclasses import dataclass, replace
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Collection
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -25,6 +25,7 @@ except Exception:  # pragma: no cover - optional dependency
 from hushdesk.ui.theme import load_theme_name, save_theme_name, select_palette
 from hushdesk.ui.util import hall_from_rooms
 from hushdesk.pdf.backends import MuPdfBackend, PdfUnavailable, PlumberBackend, get_backend
+from hushdesk.pdf.grid_geometry import ParameterStrip, install_progress_callback, parameter_strips
 from hushdesk.core.engine import run_sim, run_pdf as pdf_engine
 from hushdesk.core.rules import holds as holds_rules
 from hushdesk.core.layout import blocks as layout_blocks
@@ -34,6 +35,28 @@ from hushdesk.core.pdf.reader import open_pdf, page_text_in_rect, page_text_span
 from hushdesk.core.layout.grid import detect_day_columns, nearest_day_band
 from hushdesk.core import building_master as BM
 from hushdesk.version import APP_VERSION
+
+
+_ROOM_TOKEN_RE = re.compile(r"\b\d{3}(?:[- ]?[A-Z0-9])?\b")
+
+
+def _canonical_room_token(token: str) -> Optional[str]:
+    cleaned = (token or "").strip().upper().replace(" ", "")
+    if not cleaned:
+        return None
+    cleaned = cleaned.replace("--", "-")
+    match = re.fullmatch(r"(\d{3})(?:-?([A-Z0-9]))?", cleaned)
+    if not match:
+        return None
+    digits, suffix = match.groups()
+    letter: Optional[str]
+    if suffix in {"1", "2"}:
+        letter = "AB"[int(suffix) - 1]
+    elif suffix and suffix.isalpha():
+        letter = suffix
+    else:
+        letter = None
+    return f"{digits}{letter}" if letter else digits
 
 
 def _collapse_rule_lines(text: str) -> str:
@@ -100,6 +123,23 @@ def _rebuild_rule_text(doc, page_index: int, block: layout_blocks.Block) -> str:
     return "\n".join(rebuilt)
 
 
+@dataclass(frozen=True)
+class ParameterRuleMatch:
+    rule: holds_rules.Rule
+    snippet: str
+    med_hint: str
+    start_index: int
+    end_index: int
+    room_hint: Optional[str] = None
+
+
+@dataclass
+class ParameterPreviewResult:
+    sbp_total: int
+    hr_total: int
+    highlights: List[str]
+
+
 if not getattr(holds_rules.parse_strict_rules, "_hushdesk_continuations", False):
     _ORIG_PARSE_STRICT_RULES = holds_rules.parse_strict_rules
 
@@ -143,8 +183,35 @@ if not getattr(layout_blocks.detect_blocks, "_hushdesk_rule_rebuild", False):
         blocks = _ORIG_DETECT_BLOCKS(doc, page_index)
         if not blocks:
             return blocks
+        pdf_path = getattr(doc, "name", None)
+        if not pdf_path and hasattr(doc, "_raw"):
+            pdf_path = getattr(doc._raw, "name", None)  # type: ignore[attr-defined]
+        try:
+            strips = list(parameter_strips(pdf_path, page_index)) if pdf_path else []
+        except Exception:
+            strips = []
+
+        def _match_strip(bbox) -> Optional[str]:
+            if not strips:
+                return None
+            x0, y0, x1, y1 = bbox
+            best_text: Optional[str] = None
+            best_overlap = 0.0
+            for strip in strips:
+                overlap = min(y1, strip.y1) - max(y0, strip.y0)
+                if overlap <= 0:
+                    continue
+                if overlap > best_overlap and strip.text.strip():
+                    best_overlap = overlap
+                    best_text = strip.text.strip()
+            return best_text
+
         enriched: List[layout_blocks.Block] = []
         for block in blocks:
+            strip_text = _match_strip(block.bbox)
+            if strip_text and strip_text != block.rule_text:
+                enriched.append(replace(block, rule_text=strip_text))
+                continue
             rebuilt = _rebuild_rule_text(doc, page_index, block)
             if rebuilt and rebuilt != block.rule_text:
                 enriched.append(replace(block, rule_text=rebuilt))
@@ -158,38 +225,251 @@ if not getattr(layout_blocks.detect_blocks, "_hushdesk_rule_rebuild", False):
         pdf_engine.detect_blocks = _detect_blocks_with_rule_rebuild
 
 
-def _estimate_parametered_slots(pdf_path: str, day_bands: Dict[int, tuple[float, float]]) -> tuple[int, List[str]]:
-    if not day_bands:
-        return 0, []
-    doc = open_pdf(pdf_path)
-    try:
-        total = 0
-        highlights: List[str] = []
-        for page_index, band in day_bands.items():
-            blocks = pdf_engine.detect_blocks(doc, page_index)
-            if not blocks:
+def _collect_parameter_rules_from_lines(lines: Sequence[str]) -> List[ParameterRuleMatch]:
+    matches: List[ParameterRuleMatch] = []
+    context: List[str] = []
+    idx = 0
+    line_count = len(lines)
+    while idx < line_count:
+        raw = (lines[idx] or "").strip()
+        if not raw:
+            idx += 1
+            continue
+        upper = raw.upper()
+        if not any(token in upper for token in ("SBP", "HR", "PULSE", "HOLD", "<", ">")):
+            context.append(raw)
+            if len(context) > 8:
+                context.pop(0)
+            idx += 1
+            continue
+
+        snippet_lines: List[str] = [raw]
+        end_idx = idx
+        combined_rules: List[holds_rules.Rule] = []
+        for lookahead in range(0, 4):
+            end_idx = idx + lookahead
+            if end_idx >= line_count:
+                break
+            if lookahead > 0:
+                next_line = (lines[end_idx] or "").strip()
+                if next_line:
+                    snippet_lines.append(next_line)
+            snippet_text = " ".join(snippet_lines).strip()
+            if not snippet_text:
                 continue
-            for block in blocks:
-                rule_lines = holds_rules.parse_strict_rules(block.rule_text or "")
-                if not rule_lines:
-                    continue
-                tracks = getattr(pdf_engine, "calibrate_tracks", None)
-                track_count = 0
-                if callable(tracks):
-                    try:
-                        bands = tracks(doc, page_index, block)
-                        track_count = sum(1 for key in ("AM", "PM") if key in bands)
-                    except Exception:
-                        track_count = 0
-                if track_count == 0:
-                    track_count = 1
-                total += track_count
-                snippet = " ".join((block.rule_text or "").split())
-                if snippet:
-                    highlights.append(snippet)
-        return total, highlights
-    finally:
-        doc.close()
+            rules = list(holds_rules.parse_strict_rules(snippet_text))
+            if rules:
+                combined_rules = rules
+                break
+        if not combined_rules:
+            context.append(raw)
+            if len(context) > 8:
+                context.pop(0)
+            idx += 1
+            continue
+
+        med_hint = ""
+        for prev in reversed(context):
+            prev_clean = prev.strip()
+            if not prev_clean:
+                continue
+            upper_prev = prev_clean.upper()
+            if any(token in upper_prev for token in ("SBP", "HR", "PULSE", "HOLD")):
+                continue
+            med_hint = prev_clean
+            break
+
+        snippet_text = " ".join(snippet_lines).strip()
+        room_hint = _room_from_context(context)
+        if not room_hint and med_hint:
+            room_hint = _extract_room_identifier(med_hint)
+        if not room_hint and snippet_text:
+            room_hint = _extract_room_identifier(snippet_text)
+        for rule in combined_rules:
+            matches.append(
+                ParameterRuleMatch(
+                    rule=rule,
+                    snippet=snippet_text,
+                    med_hint=med_hint,
+                    start_index=idx,
+                    end_index=end_idx,
+                    room_hint=room_hint,
+                )
+            )
+
+        idx = end_idx + 1
+        context.clear()
+    return matches
+
+
+def _sanitize_preview_text(text: str) -> str:
+    if not text:
+        return ""
+    cleaned = text.replace("\xa0", " ")
+    cleaned = "".join(ch if 32 <= ord(ch) < 127 else " " for ch in cleaned)
+    return " ".join(cleaned.split())
+
+
+def _extract_room_identifier(text: str) -> Optional[str]:
+    if not text:
+        return None
+    for match in _ROOM_TOKEN_RE.finditer(text):
+        room = _canonical_room_token(match.group(0))
+        if room:
+            return room
+    return None
+
+
+def _room_from_context(lines: Sequence[str]) -> Optional[str]:
+    for raw in reversed(lines):
+        room = _extract_room_identifier(raw)
+        if room:
+            return room
+    return None
+
+
+def _canonical_preview_room(room: Optional[str], valid_rooms: Optional[Collection[str]] = None) -> Optional[str]:
+    if not room:
+        return None
+    raw = str(room).strip()
+    if not raw:
+        return None
+    cleaned = raw.replace("\xa0", " ").strip()
+    if not cleaned:
+        return None
+    valid_set = set(valid_rooms) if valid_rooms else None
+    try:
+        canonical = BM.canonicalize_room(cleaned)
+    except Exception:
+        canonical = None
+    if canonical:
+        if valid_set and canonical not in valid_set:
+            return None
+        return canonical
+    token = "".join(ch for ch in cleaned if not ch.isspace()).upper()
+    match = re.match(r"^([1-4]\d{2})(?:-?([AB12]))$", token)
+    if not match:
+        return None
+    base, suffix = match.groups()
+    if suffix in {"A", "B"}:
+        suffix = "1" if suffix == "A" else "2"
+    if suffix not in {"1", "2"}:
+        return None
+    derived = f"{base}-{suffix}"
+    if valid_set and derived not in valid_set:
+        return None
+    return derived
+
+
+def _build_strip_lookup(
+    pdf_path: str, valid_rooms: Optional[Collection[str]] = None
+) -> Dict[int, List[tuple[str, Optional[str]]]]:
+    try:
+        cache = parameter_strips(pdf_path)
+    except Exception:
+        return {}
+    lookup: Dict[int, List[tuple[str, Optional[str]]]] = {}
+    valid_set: Optional[set[str]] = set(valid_rooms) if valid_rooms else None
+    items: Iterable[tuple[int, Sequence[ParameterStrip]]]
+    if isinstance(cache, dict):
+        items = cache.items()
+    else:
+        items = enumerate(cache)  # type: ignore[arg-type]
+    for page_index, strips in items:
+        entries: List[tuple[str, Optional[str]]] = []
+        for strip in strips:
+            text = _sanitize_preview_text(getattr(strip, "text", ""))
+            if not text:
+                continue
+            room = _canonical_preview_room(getattr(strip, "room", None), valid_set)
+            entries.append((text.upper(), room))
+        if entries:
+            lookup[page_index] = entries
+    return lookup
+
+
+def _match_room_from_strips(
+    lookup: Dict[int, List[tuple[str, Optional[str]]]],
+    page_index: int,
+    match: ParameterRuleMatch,
+) -> Optional[str]:
+    entries = lookup.get(page_index)
+    if not entries:
+        return None
+    fragment = f"{match.rule.metric} {match.rule.op} {match.rule.threshold}".upper()
+    med_hint = _sanitize_preview_text(match.med_hint).upper()
+    snippet = _sanitize_preview_text(match.snippet).upper()
+    best_score = -1
+    best_room: Optional[str] = None
+    for text_upper, room in entries:
+        if not room:
+            continue
+        if fragment in text_upper:
+            score = 3
+        elif match.rule.metric in text_upper and str(match.rule.threshold) in text_upper:
+            score = 1
+        else:
+            continue
+        if med_hint and med_hint in text_upper:
+            score += 2
+        if snippet and snippet in text_upper:
+            score += 1
+        if score > best_score:
+            best_score = score
+            best_room = room
+    return best_room
+
+
+def _format_preview_description(match: ParameterRuleMatch, *, room: Optional[str] = None) -> str:
+    med_hint = _sanitize_preview_text(match.med_hint)
+    fragment = f"Hold for {match.rule.metric} {match.rule.op} {match.rule.threshold}"
+    if med_hint:
+        description = f"{med_hint} - {fragment}"
+    else:
+        snippet = _sanitize_preview_text(match.snippet)
+        if snippet:
+            description = snippet if fragment in snippet else f"{snippet} ({fragment})"
+        else:
+            description = fragment
+    if room:
+        return f"Room {room} - {description}"
+    return description
+
+
+def _estimate_parametered_slots(
+    pdf_path: str,
+    day_bands: Dict[int, tuple[float, float]],
+    valid_rooms: Optional[Collection[str]] = None,
+) -> ParameterPreviewResult:
+    if not day_bands:
+        return ParameterPreviewResult(sbp_total=0, hr_total=0, highlights=[])
+    try:
+        pages = extract_text_by_page(pdf_path)
+    except Exception:
+        return ParameterPreviewResult(sbp_total=0, hr_total=0, highlights=[])
+
+    valid_set = set(valid_rooms) if valid_rooms else None
+    strip_lookup = _build_strip_lookup(pdf_path, valid_set)
+    sbp_total = 0
+    hr_total = 0
+    highlights: List[str] = []
+    for page_index in sorted(day_bands.keys()):
+        if page_index >= len(pages):
+            continue
+        lines = pages[page_index] or []
+        matches = _collect_parameter_rules_from_lines(lines)
+        for match in matches:
+            if match.rule.metric == "SBP":
+                sbp_total += 1
+            elif match.rule.metric == "HR":
+                hr_total += 1
+            room = _match_room_from_strips(strip_lookup, page_index, match)
+            if room:
+                room = _canonical_preview_room(room, valid_set)
+            if not room:
+                room = _canonical_preview_room(match.room_hint, valid_set)
+            highlights.append(_format_preview_description(match, room=room))
+    return ParameterPreviewResult(sbp_total=sbp_total, hr_total=hr_total, highlights=highlights)
 
 
 def run_simulation(fixture_path: str, room_pattern: str | None = None) -> dict:
@@ -250,6 +530,17 @@ def _infer_date_from_filename(pdf_path: str) -> Optional[str]:
 
 def _default_date_str() -> str:
     return (datetime.now() - timedelta(days=1)).strftime("%m-%d-%Y")
+
+
+def _service_day_from_report(report_date: str) -> Optional[str]:
+    normalized = _ensure_mmddyyyy(report_date)
+    if not normalized:
+        return None
+    try:
+        dt_obj = datetime.strptime(normalized, "%m-%d-%Y")
+    except ValueError:
+        return None
+    return (dt_obj - timedelta(days=1)).strftime("%m-%d-%Y")
 
 
 def _canonical_rooms(rooms: List[str]) -> List[str]:
@@ -527,18 +818,30 @@ def run_pdf_backend(
     elif hall_source == "suggested":
         notes.append(f"Preview metrics use hall suggestion: {hall_name}. Update if incorrect.")
 
-    normalized_date = _ensure_mmddyyyy(date_str) if date_str else None
-    if not normalized_date:
+    report_date: Optional[str] = None
+    service_date = _ensure_mmddyyyy(date_str) if date_str else None
+    if not service_date:
         inferred = _infer_date_from_filename(pdf_path)
         if inferred:
-            normalized_date = inferred
-            notes.append(f"Date inferred from file name: {normalized_date}")
-    if not normalized_date:
-        normalized_date = _default_date_str()
-        notes.append(f"Date defaulted to yesterday: {normalized_date}")
-    meta.setdefault("filters", {})["date"] = normalized_date
+            report_date = _ensure_mmddyyyy(inferred) or inferred
+            if report_date:
+                notes.append(f"Report date inferred from file name: {report_date}")
+            service_candidate = _service_day_from_report(inferred)
+            if service_candidate:
+                service_date = service_candidate
+                notes.append(f"Service day automatically set to {service_candidate}.")
+            elif report_date:
+                service_date = report_date
+    if not service_date:
+        service_date = _default_date_str()
+        notes.append(f"Service day defaulted to yesterday: {service_date}")
+    filters = meta.setdefault("filters", {})
+    filters["date"] = service_date
     if hall_name:
-        meta["filters"]["hall"] = hall_name
+        filters["hall"] = hall_name
+    meta["service_date"] = service_date
+    if report_date:
+        meta["report_date"] = report_date
 
     room_regex = None
     if room_filter:
@@ -580,7 +883,7 @@ def run_pdf_backend(
     }
     sections: Dict[str, List[str]] = {"HOLD-MISS": [], "HELD-APPROPRIATE": [], "COMPLIANT": [], "DC'D": []}
     header_payload: Dict[str, str] = {
-        "date_str": normalized_date,
+        "date_str": service_date,
         "hall": hall_name or "",
         "source": Path(pdf_path).name,
     }
@@ -604,12 +907,12 @@ def run_pdf_backend(
             day_bands: Dict[int, tuple[float, float]] = {}
             pages_count = resolver.pages if resolver else meta.get("pages", 0)
             if resolver:
-                target_day = _parse_day_from_date(normalized_date)
+                target_day = _parse_day_from_date(service_date)
                 day_bands = resolver.bands_for_day(target_day)
             decisions, header_meta = _build_preview_decisions(
                 pdf_path=pdf_path,
                 hall=hall_name,
-                date_str=normalized_date,
+                date_str=service_date,
                 rooms=rooms,
                 day_bands=day_bands,
                 page_count=pages_count if isinstance(pages_count, int) else 0,
@@ -623,15 +926,18 @@ def run_pdf_backend(
                 rooms_payload = list(preview_payload.get("rooms", []))
             else:
                 rooms_payload = list(preview_payload.get("rooms", [])) or rooms_payload
-                approx_total, approx_rules = _estimate_parametered_slots(pdf_path, day_bands)
-                if approx_total:
-                    summary["reviewed"] = approx_total
-                    summary["compliant"] = approx_total
+                preview = _estimate_parametered_slots(pdf_path, day_bands, rooms)
+                if preview.sbp_total:
+                    summary["reviewed"] = preview.sbp_total
+                    summary["compliant"] = preview.sbp_total
                     notes.append(
-                        f"Preview metrics estimated from {approx_total} parametered dose slots; run full audit for rule compliance."
+                        f"Preview metrics estimated from {preview.sbp_total} SBP-parametered dose slots; run full audit for rule compliance."
                     )
-                    if approx_rules:
-                        meta.setdefault("preview_rules", approx_rules[:8])
+                    if preview.hr_total:
+                        notes.append(f"Additional HR thresholds detected: {preview.hr_total}.")
+                    if preview.highlights:
+                        meta["preview_rules"] = preview.highlights
+                        meta["preview_rules_sample"] = preview.highlights[:12]
                 elif doses:
                     notes.append(
                         "Preview metrics unavailable: no parametered meds matched the selected hall/day; showing raw parse counts."
@@ -672,6 +978,8 @@ class HushDeskApp:
             "detected_hall_num": None,
             "hall_suggestions": [],
         }
+        self._progress_mode = "idle"
+        self._progress_total = 0
         self._updating_hall_entry = False
         self._suppress_hall_events = False
         self._hall_choices = BM.halls()
@@ -1210,6 +1518,23 @@ class HushDeskApp:
                 pass
         return backend
 
+    def _apply_geometry_progress(self, done: int, total: int) -> None:
+        if self._progress_mode != "audit":
+            return
+        total = max(int(total), 1)
+        clamped = max(0, min(int(done), total))
+        if self._progress_total != total:
+            self._progress_total = total
+            self.progress.configure(mode="determinate", maximum=total)
+        self.progress.configure(value=clamped)
+        if clamped == 0:
+            label = f"Preparing... (0/{total} pages)"
+        elif clamped >= total:
+            label = f"Processed {total}/{total} pages"
+        else:
+            label = f"Processing {clamped}/{total} pages"
+        self.progress_lbl.configure(text=label)
+
     def _run_pdf_pipeline(
         self, path: Path, backend: Any, room_pattern: str | None, hall_override: str | None
     ) -> dict:
@@ -1224,7 +1549,13 @@ class HushDeskApp:
         self.state["pdf_backend"] = backend_name
         if hasattr(self, "preflight_var"):
             self.preflight_var.set(self._format_preflight_status())
-        return run_pdf_backend(str(path), date_str="", room_filter=room_pattern, hall_override=hall_override)
+        def _progress(done: int, total: int) -> None:
+            self.root.after(0, lambda d=done, t=total: self._apply_geometry_progress(d, t))
+        install_progress_callback(_progress)
+        try:
+            return run_pdf_backend(str(path), date_str="", room_filter=room_pattern, hall_override=hall_override)
+        finally:
+            install_progress_callback(None)
 
     # ------------------------------------------------------------------
     # Rendering helpers
@@ -1410,6 +1741,16 @@ class HushDeskApp:
         )
         text.insert("end", f"{guidance_text}\n", ("muted",))
 
+        preview_rules = meta_info.get("preview_rules_sample") or meta_info.get("preview_rules")
+        if preview_rules:
+            text.insert("end", "\nParameter Rule Hits\n", ("section",))
+            for rule_line in preview_rules:
+                text.insert("end", f"  {rule_line}\n")
+            total_rules = len(meta_info.get("preview_rules", preview_rules))
+            if total_rules > len(preview_rules):
+                remaining = total_rules - len(preview_rules)
+                text.insert("end", f"  ... ({remaining} additional rules available in the export.)\n", ("muted",))
+
         for note in notes:
             text.insert("end", f"\nNote: {note}\n", ("muted",))
 
@@ -1588,6 +1929,7 @@ class HushDeskApp:
         self.audit_date_var.set(f"Audit Date: {payload['header']['date_str']} (Central)")
 
     def _after_start(self, text: str, mode: str) -> None:
+        self._progress_mode = mode
         if mode == "quick":
             self.progress.configure(mode="indeterminate")
             self.progress.start(55)
@@ -1595,8 +1937,11 @@ class HushDeskApp:
         else:
             self.progress.configure(mode="determinate", value=0, maximum=100)
             self.progress_lbl.configure(text=text)
+            self._progress_total = 0
 
     def _after_finish(self) -> None:
+        self._progress_mode = "idle"
+        self._progress_total = 0
         self.progress.stop()
         self.progress_lbl.configure(text="")
         self.progress.configure(value=0)

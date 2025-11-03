@@ -79,6 +79,34 @@ def header_footer_pdf(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return out
 
 @pytest.fixture(scope="session")
+def parameter_rules_pdf(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    if fitz is None:
+        pytest.skip("PyMuPDF not installed; synthetic PDF generation requires fitz")
+    out = tmp_path_factory.mktemp("pdfs") / "parameter_rules.pdf"
+    if out.exists():
+        return out
+    rows_page = [
+        ["101A", "Lisinopril", "06:00 ✓", "18:00 ✓"],
+        ["202B", "Metoprolol", "—", "20:00 !"],
+        ["303C", "Furosemide", "—", "—"],
+    ]
+    left_text = [
+        "Hold for SBP less\nthan 90",
+        "Hold for SBP greater than 160",
+        "",
+    ]
+    _write_synthetic_pdf(
+        out,
+        pages=[rows_page],
+        header_text="Param Header",
+        footer_text="Footer",
+        jitter=False,
+        left_text_pages=[left_text],
+        draw_grid=True,
+    )
+    return out
+
+@pytest.fixture(scope="session")
 def monthly_mar_pdf(tmp_path_factory: pytest.TempPathFactory) -> Path:
     if fitz is None:
         pytest.skip("PyMuPDF not installed; synthetic PDF generation requires fitz")
@@ -105,7 +133,9 @@ def _draw_row(page: "fitz.Page", row: Sequence[str], xs: Sequence[float], y: flo
         page.insert_text(fitz.Point(xs[i], y), cell, fontsize=12, fontname="helv")
 
 def _write_synthetic_pdf(path: Path, pages: Iterable[Iterable[Sequence[str]]],
-                         header_text: str, footer_text: str, jitter: bool) -> None:
+                         header_text: str, footer_text: str, jitter: bool,
+                         left_text_pages: Optional[Sequence[Sequence[str]]] = None,
+                         draw_grid: bool = False) -> None:
     assert fitz is not None, "PyMuPDF required to synthesize PDFs in tests"
     doc = fitz.open()
     xs = [72.0, 220.0, 360.0, 480.0]
@@ -117,7 +147,44 @@ def _write_synthetic_pdf(path: Path, pages: Iterable[Iterable[Sequence[str]]],
         y = header_base
         _draw_row(page, _HEADER_ROW, xs, y)
         y += line_h
+        if draw_grid:
+            grid_left = 60.0
+            col_widths = [140.0, 200.0, 120.0, 120.0]
+            total_width = sum(col_widths)
+            row_count = len(rows) + 1
+            grid_top = y - 6.0
+            grid_bottom = grid_top + row_count * line_h
+            x_positions = [grid_left]
+            for width in col_widths:
+                x_positions.append(x_positions[-1] + width)
+            for idx in range(row_count + 1):
+                line_y = grid_top + idx * line_h
+                page.draw_line(
+                    fitz.Point(grid_left, line_y),
+                    fitz.Point(grid_left + total_width, line_y),
+                    color=(0, 0, 0),
+                    width=0.5,
+                )
+            for x_pos in x_positions:
+                page.draw_line(
+                    fitz.Point(x_pos, grid_top),
+                    fitz.Point(x_pos, grid_bottom),
+                    color=(0, 0, 0),
+                    width=0.5,
+                )
+        left_rows = left_text_pages[page_index - 1] if left_text_pages and page_index - 1 < len(left_text_pages) else None
         for r_idx, row in enumerate(rows):
+            if left_rows:
+                left_text = left_rows[r_idx] if r_idx < len(left_rows) else ""
+                if left_text:
+                    base_y = y + _row_jitter(r_idx, jitter, line_h)
+                    for line_offset, chunk in enumerate(str(left_text).splitlines()):
+                        page.insert_text(
+                            fitz.Point(36.0, base_y + line_offset * 10.0),
+                            chunk,
+                            fontsize=11,
+                            fontname="helv",
+                        )
             _draw_row(page, row, xs, y + _row_jitter(r_idx, jitter, line_h))
             y += line_h
         page.insert_text(fitz.Point(180, 742), f"{footer_text} {page_index}", fontsize=10, fontname="helv")
